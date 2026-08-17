@@ -28,8 +28,7 @@ def ping_device(ip_address: str, timeout_seconds: int = 2) -> PingResult:
 
     started_at = time.perf_counter()
     try:
-        # shell=False (the default) prevents an address from being interpreted as
-        # a shell command. Device addresses are also validated by Django as IPv4.
+        # shell=False prevents address values from being treated as shell commands.
         completed = subprocess.run(
             command,
             capture_output=True,
@@ -92,6 +91,7 @@ def record_availability_result(
     # A successful poll following a DOWN state resolves every open outage alert
     # for that device and preserves both the opening and recovery timestamps.
     elif current_status == Device.Status.UP and previous_status == Device.Status.DOWN:
+        # resolve any open outage alerts for this device after recovery
         Alert.objects.filter(
             device=device,
             status=Alert.Status.OPEN,

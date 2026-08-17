@@ -1,5 +1,6 @@
+#basecommand is the base class for custom django management commands
 from django.core.management.base import BaseCommand
-
+#device is the django models imported from the monitoring.models
 from monitoring.models import Device
 
 
@@ -38,11 +39,14 @@ LAB_DEVICES = (
     },
 )
 
-
+# command defines a custom django management command.
 class Command(BaseCommand):
     """Populate the database with the known baseline GNS3 devices."""
-
+# help is the text shown when python manage.py help is rna
     help = "Create or update the initial GNS3 lab device inventory."
+
+# handle is the method django runs whenever a command is executed and loops through each device defines in lab devices
+
 
     def handle(self, *args, **options):
         for item in LAB_DEVICES:

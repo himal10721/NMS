@@ -3,6 +3,7 @@ from django.contrib import admin
 from .models import Alert, AvailabilityCheck, Device
 
 
+# register Device with the Django admin site
 @admin.register(Device)
 class DeviceAdmin(admin.ModelAdmin):
     list_display = (
@@ -27,6 +28,7 @@ class DeviceAdmin(admin.ModelAdmin):
 
 
 @admin.register(AvailabilityCheck)
+# register availability history records in the admin
 class AvailabilityCheckAdmin(admin.ModelAdmin):
     list_display = (
         "device",
@@ -47,6 +49,7 @@ class AvailabilityCheckAdmin(admin.ModelAdmin):
 
 
 @admin.register(Alert)
+# register alert records so outages can be viewed in admin
 class AlertAdmin(admin.ModelAdmin):
     list_display = ("device", "status", "opened_at", "resolved_at", "message")
     list_filter = ("status", "opened_at")

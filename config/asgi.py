@@ -11,6 +11,8 @@ import os
 
 from django.core.asgi import get_asgi_application
 
+# tell Django which settings module to use for ASGI requests
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
 
+# create the ASGI application used by ASGI servers
 application = get_asgi_application()

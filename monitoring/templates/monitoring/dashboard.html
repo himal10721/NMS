@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Network Monitoring Dashboard</title>
+</head>
+<body>
+    <header>
+        <h1>Network Monitoring Dashboard</h1>
+        <a href="{% url 'admin:index' %}">Administration</a>
+    </header>
+
+    <main>
+        <section>
+            <h2>Network summary</h2>
+            <p>Total devices: {{ total_devices }}</p>
+            <p>UP: {{ up_devices }}</p>
+            <p>DOWN: {{ down_devices }}</p>
+            <p>UNKNOWN: {{ unknown_devices }}</p>
+        </section>
+
+        <section>
+            <h2>Devices</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Device</th>
+                        <th>IP address</th>
+                        <th>Type</th>
+                        <th>VLAN</th>
+                        <th>Status</th>
+                        <th>Response time</th>
+                        <th>Last checked</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for device in devices %}
+                        <tr>
+                            <td>{{ device.name }}</td>
+                            <td>{{ device.ip_address }}</td>
+                            <td>{{ device.get_device_type_display }}</td>
+                            <td>{{ device.vlan_id }}</td>
+                            <td>{{ device.get_last_status_display }}</td>
+                            <td>
+                                {% if device.last_response_time_ms is not None %}
+                                    {{ device.last_response_time_ms|floatformat:2 }} ms
+                                {% else %}
+                                    N/A
+                                {% endif %}
+                            </td>
+                            <td>{{ device.last_checked_at|default:"Never" }}</td>
+                        </tr>
+                    {% empty %}
+                        <tr>
+                            <td colspan="7">No devices have been added.</td>
+                        </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </section>
+
+        <section>
+            <h2>Open alerts</h2>
+            <ul>
+                {% for alert in open_alerts %}
+                    <li>{{ alert.message }} Opened: {{ alert.opened_at }}</li>
+                {% empty %}
+                    <li>No open alerts.</li>
+                {% endfor %}
+            </ul>
+        </section>
+
+        <section>
+            <h2>Recent availability checks</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Device</th>
+                        <th>Time</th>
+                        <th>Reachable</th>
+                        <th>Response time</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for check in recent_checks %}
+                        <tr>
+                            <td>{{ check.device.name }}</td>
+                            <td>{{ check.checked_at }}</td>
+                            <td>{{ check.is_reachable|yesno:"Yes,No" }}</td>
+                            <td>
+                                {% if check.response_time_ms is not None %}
+                                    {{ check.response_time_ms|floatformat:2 }} ms
+                                {% else %}
+                                    N/A
+                                {% endif %}
+                            </td>
+                        </tr>
+                    {% empty %}
+                        <tr>
+                            <td colspan="4">No availability checks recorded.</td>
+                        </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </section>
+    </main>
+</body>
+</html>

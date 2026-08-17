@@ -11,6 +11,8 @@ import os
 
 from django.core.wsgi import get_wsgi_application
 
+# tell Django which settings module to use for WSGI requests
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
 
+# create the WSGI application used by WSGI servers
 application = get_wsgi_application()
