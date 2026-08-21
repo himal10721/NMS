@@ -1,3 +1,5 @@
+from unittest.mock import AsyncMock, patch
+
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.urls import reverse
@@ -12,7 +14,14 @@ from .models import (
     NetworkEvent,
     NetworkInterface,
 )
-from .services import PingResult, record_availability_result
+from .services import (
+    MemoryResult,
+    PingResult,
+    SnmpResult,
+    poll_memory_usage,
+    poll_system_uptime,
+    record_availability_result,
+)
 
 
 class AvailabilityRecordingTests(TestCase):
@@ -170,6 +179,64 @@ class ExpandedDatabaseModelTests(TestCase):
 
         self.assertEqual(event.alerts.count(), 1)
         self.assertEqual(alert.network_event, event)
+
+
+class SnmpPollingTests(TestCase):
+    def setUp(self):
+        self.device = Device.objects.create(
+            name="R1-snmp",
+            ip_address="192.168.10.101",
+            device_type=Device.DeviceType.ROUTER,
+            vlan_id=10,
+        )
+
+    @patch("monitoring.services.fetch_snmp_timeticks", new_callable=AsyncMock)
+    def test_poll_system_uptime_stores_successful_metric(self, mock_fetch):
+        mock_fetch.return_value = SnmpResult(True, 52.97)
+
+        record = poll_system_uptime(self.device, "test-community")
+
+        self.assertTrue(record.collection_successful)
+        self.assertEqual(record.numeric_value, 52.97)
+        self.assertEqual(record.metric_definition.key, "system_uptime")
+        self.assertEqual(record.metric_definition.unit, "minutes")
+
+    @patch("monitoring.services.fetch_snmp_timeticks", new_callable=AsyncMock)
+    def test_poll_system_uptime_stores_failed_collection(self, mock_fetch):
+        mock_fetch.return_value = SnmpResult(False, None, "No SNMP response")
+
+        record = poll_system_uptime(self.device, "invalid-community")
+
+        self.assertFalse(record.collection_successful)
+        self.assertIsNone(record.numeric_value)
+        self.assertEqual(record.text_value, "No SNMP response")
+
+    @patch("monitoring.services.fetch_memory_usage", new_callable=AsyncMock)
+    def test_poll_memory_usage_stores_mb_and_percentage(self, mock_fetch):
+        mock_fetch.return_value = MemoryResult(
+            True,
+            used_bytes=50 * 1024 * 1024,
+            free_bytes=350 * 1024 * 1024,
+        )
+
+        records = poll_memory_usage(self.device, "test-community")
+
+        self.assertEqual(records["memory_used_mb"].numeric_value, 50.0)
+        self.assertEqual(records["memory_free_mb"].numeric_value, 350.0)
+        self.assertEqual(records["memory_usage_percent"].numeric_value, 12.5)
+        self.assertTrue(records["memory_usage_percent"].collection_successful)
+
+    @patch("monitoring.services.fetch_memory_usage", new_callable=AsyncMock)
+    def test_poll_memory_usage_stores_failed_collection(self, mock_fetch):
+        mock_fetch.return_value = MemoryResult(False, None, None, "SNMP timeout")
+
+        records = poll_memory_usage(self.device, "invalid-community")
+
+        self.assertEqual(len(records), 3)
+        for record in records.values():
+            self.assertFalse(record.collection_successful)
+            self.assertIsNone(record.numeric_value)
+            self.assertEqual(record.text_value, "SNMP timeout")
 
 
 class DashboardTests(TestCase):

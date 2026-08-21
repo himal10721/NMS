@@ -1,3 +1,4 @@
+import asyncio
 import platform
 import subprocess
 import time
@@ -5,8 +6,28 @@ from dataclasses import dataclass
 
 from django.db import transaction
 from django.utils import timezone
+from pysnmp.hlapi.v3arch.asyncio import (
+    CommunityData,
+    ContextData,
+    ObjectIdentity,
+    ObjectType,
+    SnmpEngine,
+    UdpTransportTarget,
+    get_cmd,
+)
 
-from .models import Alert, AvailabilityCheck, Device
+from .models import (
+    Alert,
+    AvailabilityCheck,
+    Device,
+    MetricDefinition,
+    MetricRecord,
+)
+
+
+SYS_UPTIME_OID = "1.3.6.1.2.1.1.3.0"
+CISCO_MEMORY_USED_OID = "1.3.6.1.4.1.9.9.48.1.1.1.5.1"
+CISCO_MEMORY_FREE_OID = "1.3.6.1.4.1.9.9.48.1.1.1.6.1"
 
 
 @dataclass(frozen=True)
@@ -16,6 +37,122 @@ class PingResult:
     is_reachable: bool
     response_time_ms: float | None
     error: str = ""
+
+
+@dataclass(frozen=True)
+class SnmpResult:
+    """Normalized result of one SNMP metric request."""
+
+    successful: bool
+    value: float | None
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class MemoryResult:
+    """Normalized Cisco processor-memory values returned through SNMP."""
+
+    successful: bool
+    used_bytes: int | None
+    free_bytes: int | None
+    error: str = ""
+
+    @property
+    def usage_percent(self) -> float | None:
+        """Calculate used memory as a percentage of total processor memory."""
+
+        if self.used_bytes is None or self.free_bytes is None:
+            return None
+        total_bytes = self.used_bytes + self.free_bytes
+        if total_bytes == 0:
+            return None
+        return round((self.used_bytes / total_bytes) * 100, 2)
+
+
+async def fetch_snmp_timeticks(
+    ip_address: str,
+    community: str,
+    oid: str = SYS_UPTIME_OID,
+    timeout_seconds: int = 2,
+) -> SnmpResult:
+    """Retrieve an SNMP TimeTicks value and convert it to minutes."""
+
+    try:
+        transport = await UdpTransportTarget.create(
+            (ip_address, 161),
+            timeout=timeout_seconds,
+            retries=1,
+        )
+        error_indication, error_status, error_index, var_binds = await get_cmd(
+            SnmpEngine(),
+            CommunityData(community, mpModel=1),
+            transport,
+            ContextData(),
+            ObjectType(ObjectIdentity(oid)),
+        )
+    except Exception as exc:  # PySNMP can raise transport and decoding errors.
+        return SnmpResult(False, None, str(exc))
+
+    if error_indication:
+        return SnmpResult(False, None, str(error_indication))
+
+    if error_status:
+        error = f"{error_status.prettyPrint()} at index {error_index}"
+        return SnmpResult(False, None, error)
+
+    if not var_binds:
+        return SnmpResult(False, None, "SNMP response contained no values.")
+
+    try:
+        # SNMP TimeTicks are hundredths of a second; 6,000 ticks equal a minute.
+        uptime_minutes = round(int(var_binds[0][1]) / 6000, 2)
+    except (TypeError, ValueError, IndexError) as exc:
+        return SnmpResult(False, None, f"Invalid SNMP value: {exc}")
+
+    return SnmpResult(True, uptime_minutes)
+
+
+async def fetch_memory_usage(
+    ip_address: str,
+    community: str,
+    timeout_seconds: int = 2,
+) -> MemoryResult:
+    """Retrieve used and free bytes from Cisco's Processor memory pool."""
+
+    try:
+        transport = await UdpTransportTarget.create(
+            (ip_address, 161),
+            timeout=timeout_seconds,
+            retries=1,
+        )
+        error_indication, error_status, error_index, var_binds = await get_cmd(
+            SnmpEngine(),
+            CommunityData(community, mpModel=1),
+            transport,
+            ContextData(),
+            ObjectType(ObjectIdentity(CISCO_MEMORY_USED_OID)),
+            ObjectType(ObjectIdentity(CISCO_MEMORY_FREE_OID)),
+        )
+    except Exception as exc:
+        return MemoryResult(False, None, None, str(exc))
+
+    if error_indication:
+        return MemoryResult(False, None, None, str(error_indication))
+
+    if error_status:
+        error = f"{error_status.prettyPrint()} at index {error_index}"
+        return MemoryResult(False, None, None, error)
+
+    if len(var_binds) != 2:
+        return MemoryResult(False, None, None, "Incomplete SNMP memory response.")
+
+    try:
+        used_bytes = int(var_binds[0][1])
+        free_bytes = int(var_binds[1][1])
+    except (TypeError, ValueError, IndexError) as exc:
+        return MemoryResult(False, None, None, f"Invalid memory value: {exc}")
+
+    return MemoryResult(True, used_bytes, free_bytes)
 
 
 def ping_device(ip_address: str, timeout_seconds: int = 2) -> PingResult:
@@ -107,3 +244,118 @@ def poll_device(device: Device) -> AvailabilityCheck:
     """Run and record one availability poll for a device."""
     result = ping_device(device.ip_address)
     return record_availability_result(device, result)
+
+
+@transaction.atomic
+def record_system_uptime(
+    device: Device,
+    result: SnmpResult,
+    collected_at=None,
+) -> MetricRecord:
+    """Store one successful or failed SNMP system-uptime collection."""
+
+    definition, _ = MetricDefinition.objects.update_or_create(
+        key="system_uptime",
+        defaults={
+            "display_name": "System uptime",
+            "unit": "minutes",
+            "data_type": MetricDefinition.DataType.FLOAT,
+            "source_protocol": MetricDefinition.SourceProtocol.SNMP,
+            "oid": SYS_UPTIME_OID,
+        },
+    )
+
+    return MetricRecord.objects.create(
+        device=device,
+        metric_definition=definition,
+        numeric_value=result.value,
+        text_value=result.error,
+        collected_at=collected_at or timezone.now(),
+        collection_successful=result.successful,
+    )
+
+
+def poll_system_uptime(device: Device, community: str) -> MetricRecord:
+    """Retrieve and store one device-uptime measurement through SNMP."""
+
+    result = asyncio.run(
+        fetch_snmp_timeticks(
+            ip_address=str(device.ip_address),
+            community=community,
+        )
+    )
+    return record_system_uptime(device, result)
+
+
+@transaction.atomic
+def record_memory_usage(
+    device: Device,
+    result: MemoryResult,
+    collected_at=None,
+) -> dict[str, MetricRecord]:
+    """Store Cisco processor-memory usage, free memory, and percentage."""
+
+    collected_at = collected_at or timezone.now()
+    definitions = {
+        "memory_used_mb": {
+            "display_name": "Memory used",
+            "unit": "MB",
+            "oid": CISCO_MEMORY_USED_OID,
+        },
+        "memory_free_mb": {
+            "display_name": "Memory free",
+            "unit": "MB",
+            "oid": CISCO_MEMORY_FREE_OID,
+        },
+        "memory_usage_percent": {
+            "display_name": "Memory usage",
+            "unit": "%",
+            "oid": f"{CISCO_MEMORY_USED_OID} + {CISCO_MEMORY_FREE_OID}",
+        },
+    }
+    values = {
+        "memory_used_mb": (
+            round(result.used_bytes / (1024 * 1024), 2)
+            if result.used_bytes is not None
+            else None
+        ),
+        "memory_free_mb": (
+            round(result.free_bytes / (1024 * 1024), 2)
+            if result.free_bytes is not None
+            else None
+        ),
+        "memory_usage_percent": result.usage_percent,
+    }
+
+    records = {}
+    for key, metadata in definitions.items():
+        definition, _ = MetricDefinition.objects.update_or_create(
+            key=key,
+            defaults={
+                **metadata,
+                "data_type": MetricDefinition.DataType.FLOAT,
+                "source_protocol": MetricDefinition.SourceProtocol.SNMP,
+            },
+        )
+        records[key] = MetricRecord.objects.create(
+            device=device,
+            metric_definition=definition,
+            numeric_value=values[key],
+            text_value=result.error,
+            collected_at=collected_at,
+            collection_successful=result.successful,
+        )
+
+    return records
+
+
+def poll_memory_usage(device: Device, community: str) -> dict[str, MetricRecord]:
+    """Retrieve and store Cisco processor-memory measurements."""
+
+    result = asyncio.run(
+        fetch_memory_usage(
+            ip_address=str(device.ip_address),
+            community=community,
+        )
+    )
+    return record_memory_usage(device, result)
