@@ -22,12 +22,24 @@ from .models import (
     Device,
     MetricDefinition,
     MetricRecord,
+    NetworkEvent,
 )
 
 
 SYS_UPTIME_OID = "1.3.6.1.2.1.1.3.0"
 CISCO_MEMORY_USED_OID = "1.3.6.1.4.1.9.9.48.1.1.1.5.1"
 CISCO_MEMORY_FREE_OID = "1.3.6.1.4.1.9.9.48.1.1.1.6.1"
+
+SYSLOG_SEVERITIES = {
+    0: "emergency",
+    1: "alert",
+    2: "critical",
+    3: "error",
+    4: "warning",
+    5: "notice",
+    6: "informational",
+    7: "debug",
+}
 
 
 @dataclass(frozen=True)
@@ -359,3 +371,41 @@ def poll_memory_usage(device: Device, community: str) -> dict[str, MetricRecord]
         )
     )
     return record_memory_usage(device, result)
+
+
+def get_syslog_severity(message: str) -> str:
+    """Extract the severity from a leading syslog PRI value such as <189>."""
+
+    if not message.startswith("<"):
+        return ""
+
+    closing_bracket = message.find(">", 1, 6)
+    if closing_bracket == -1:
+        return ""
+
+    try:
+        priority = int(message[1:closing_bracket])
+    except ValueError:
+        return ""
+
+    if not 0 <= priority <= 191:
+        return ""
+    return SYSLOG_SEVERITIES[priority % 8]
+
+
+def record_syslog_event(
+    source_ip: str,
+    message: str,
+    received_at=None,
+) -> NetworkEvent:
+    """Match a syslog sender to a device and store its message through Django."""
+
+    device = Device.objects.filter(ip_address=source_ip).first()
+    return NetworkEvent.objects.create(
+        device=device,
+        source_ip=source_ip,
+        protocol=NetworkEvent.Protocol.SYSLOG,
+        severity=get_syslog_severity(message),
+        message=message or "<empty message>",
+        received_at=received_at or timezone.now(),
+    )

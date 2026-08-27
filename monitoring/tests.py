@@ -21,6 +21,7 @@ from .services import (
     poll_memory_usage,
     poll_system_uptime,
     record_availability_result,
+    record_syslog_event,
 )
 
 
@@ -237,6 +238,37 @@ class SnmpPollingTests(TestCase):
             self.assertFalse(record.collection_successful)
             self.assertIsNone(record.numeric_value)
             self.assertEqual(record.text_value, "SNMP timeout")
+
+
+class SyslogRecordingTests(TestCase):
+    def setUp(self):
+        self.device = Device.objects.create(
+            name="R1-syslog",
+            ip_address="192.168.10.101",
+            device_type=Device.DeviceType.ROUTER,
+            vlan_id=10,
+        )
+
+    def test_known_sender_is_matched_and_stored(self):
+        event = record_syslog_event(
+            "192.168.10.101",
+            "<189>%LINEPROTO-5-UPDOWN: Interface Loopback99 changed state to up",
+        )
+
+        self.assertEqual(event.device, self.device)
+        self.assertEqual(event.protocol, NetworkEvent.Protocol.SYSLOG)
+        self.assertEqual(event.severity, "notice")
+        self.assertIn("Loopback99", event.message)
+
+    def test_unknown_sender_is_stored_without_device(self):
+        event = record_syslog_event(
+            "192.168.10.250",
+            "Message without a priority value",
+        )
+
+        self.assertIsNone(event.device)
+        self.assertEqual(event.source_ip, "192.168.10.250")
+        self.assertEqual(event.severity, "")
 
 
 class DashboardTests(TestCase):
