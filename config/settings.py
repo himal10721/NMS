@@ -32,8 +32,10 @@ INSTALLED_APPS = [
     'django.contrib.contenttypes',
     'django.contrib.sessions',
     'django.contrib.messages',
-    'django.contrib.staticfiles',
+    # Keep the project app before staticfiles so its development runserver
+    # extension can wrap Django's normal static-file-aware command.
     'monitoring',
+    'django.contrib.staticfiles',
 ]
 
 MIDDLEWARE = [
@@ -117,3 +119,8 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Authentication redirects for the user-facing monitoring dashboard.
+LOGIN_URL = "login"
+LOGIN_REDIRECT_URL = "monitoring:dashboard"
+LOGOUT_REDIRECT_URL = "login"

@@ -1,12 +1,13 @@
-from django.contrib.admin.views.decorators import staff_member_required
+from django.contrib.auth.decorators import login_required, permission_required
 from django.shortcuts import render
 
 from .models import Alert, AvailabilityCheck, Device
 
 
-@staff_member_required
+@login_required
+@permission_required("monitoring.view_device", raise_exception=True)
 def dashboard(request):
-    """Show the latest device states, checks, and unresolved alerts."""
+    """Show monitoring data only to users granted device-view permission."""
     devices = Device.objects.all()
 
     context = {

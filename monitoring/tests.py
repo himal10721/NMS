@@ -1,6 +1,8 @@
 from unittest.mock import AsyncMock, patch
 
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group
+from django.core.management import call_command
 from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
@@ -23,6 +25,7 @@ from .services import (
     record_availability_result,
     record_syslog_event,
 )
+from .rbac import MONITORING_USERS_GROUP, NETWORK_ADMINISTRATORS_GROUP
 
 
 class AvailabilityRecordingTests(TestCase):
@@ -273,19 +276,21 @@ class SyslogRecordingTests(TestCase):
 
 class DashboardTests(TestCase):
     def setUp(self):
+        call_command("setup_rbac", verbosity=0)
         self.user = get_user_model().objects.create_user(
-            username="dashboard-admin",
+            username="monitoring-user",
             password="test-password",
-            is_staff=True,
         )
+        self.user.groups.add(Group.objects.get(name=MONITORING_USERS_GROUP))
         self.client.force_login(self.user)
 
-    def test_dashboard_requires_staff_login(self):
+    def test_dashboard_requires_login(self):
         self.client.logout()
 
         response = self.client.get(reverse("monitoring:dashboard"))
 
         self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse("login"), response.url)
 
     def test_dashboard_displays_device_summary(self):
         Device.objects.create(
@@ -302,3 +307,98 @@ class DashboardTests(TestCase):
         self.assertContains(response, "R1-dashboard")
         self.assertEqual(response.context["total_devices"], 1)
         self.assertEqual(response.context["up_devices"], 1)
+
+    def test_dashboard_hides_admin_link_from_monitoring_user(self):
+        response = self.client.get(reverse("monitoring:dashboard"))
+
+        self.assertNotContains(response, "Administration")
+
+
+class AuthenticationFlowTests(TestCase):
+    def setUp(self):
+        call_command("setup_rbac", verbosity=0)
+        self.user = get_user_model().objects.create_user(
+            username="readonly-user",
+            password="safe-test-password",
+        )
+        self.user.groups.add(Group.objects.get(name=MONITORING_USERS_GROUP))
+
+    def test_login_page_is_available(self):
+        response = self.client.get(reverse("login"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Login")
+
+    def test_valid_login_redirects_to_dashboard(self):
+        response = self.client.post(
+            reverse("login"),
+            {"username": "readonly-user", "password": "safe-test-password"},
+        )
+
+        self.assertRedirects(response, reverse("monitoring:dashboard"))
+
+    def test_invalid_login_does_not_authenticate_user(self):
+        response = self.client.post(
+            reverse("login"),
+            {"username": "readonly-user", "password": "incorrect-password"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "username or password was incorrect")
+        self.assertNotIn("_auth_user_id", self.client.session)
+
+    def test_authenticated_user_without_permission_receives_forbidden(self):
+        unauthorized_user = get_user_model().objects.create_user(
+            username="no-role-user",
+            password="safe-test-password",
+        )
+        self.client.force_login(unauthorized_user)
+
+        response = self.client.get(reverse("monitoring:dashboard"))
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_logout_uses_post_and_returns_to_login(self):
+        self.client.force_login(self.user)
+
+        response = self.client.post(reverse("logout"))
+
+        self.assertRedirects(response, reverse("login"))
+        self.assertNotIn("_auth_user_id", self.client.session)
+
+
+class RbacSetupTests(TestCase):
+    def test_setup_rbac_creates_read_only_monitoring_group(self):
+        call_command("setup_rbac", verbosity=0)
+
+        group = Group.objects.get(name=MONITORING_USERS_GROUP)
+        codenames = set(group.permissions.values_list("codename", flat=True))
+
+        self.assertEqual(len(codenames), 7)
+        self.assertTrue(all(name.startswith("view_") for name in codenames))
+        self.assertNotIn("change_device", codenames)
+
+    def test_setup_rbac_gives_administrators_limited_write_access(self):
+        call_command("setup_rbac", verbosity=0)
+
+        group = Group.objects.get(name=NETWORK_ADMINISTRATORS_GROUP)
+        codenames = set(group.permissions.values_list("codename", flat=True))
+
+        self.assertIn("add_device", codenames)
+        self.assertIn("change_device", codenames)
+        self.assertIn("change_alert", codenames)
+        self.assertIn("view_metricrecord", codenames)
+        self.assertNotIn("delete_metricrecord", codenames)
+
+    def test_setup_rbac_can_be_run_more_than_once(self):
+        call_command("setup_rbac", verbosity=0)
+        call_command("setup_rbac", verbosity=0)
+
+        self.assertEqual(
+            Group.objects.filter(name=MONITORING_USERS_GROUP).count(),
+            1,
+        )
+        self.assertEqual(
+            Group.objects.filter(name=NETWORK_ADMINISTRATORS_GROUP).count(),
+            1,
+        )
