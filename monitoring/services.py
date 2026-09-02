@@ -1,5 +1,6 @@
 import asyncio
 import platform
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -79,6 +80,18 @@ class MemoryResult:
         if total_bytes == 0:
             return None
         return round((self.used_bytes / total_bytes) * 100, 2)
+
+
+@dataclass(frozen=True)
+class NetworkPerformanceResult:
+    """Measurements produced by one internet-performance collection."""
+
+    average_latency_ms: float | None
+    packet_loss_percent: float | None
+    speedtest_latency_ms: float | None = None
+    download_mbps: float | None = None
+    upload_mbps: float | None = None
+    error: str = ""
 
 
 async def fetch_snmp_timeticks(
@@ -195,6 +208,160 @@ def ping_device(ip_address: str, timeout_seconds: int = 2) -> PingResult:
 
     error = (completed.stderr or completed.stdout or "Ping failed").strip()
     return PingResult(False, None, error[-500:])
+
+
+def measure_network_performance(
+    target: str = "8.8.8.8",
+    count: int = 4,
+    timeout_ms: int = 2000,
+    include_speedtest: bool = True,
+) -> NetworkPerformanceResult:
+    """Measure ICMP quality and, optionally, internet download/upload speed."""
+
+    if count < 1:
+        raise ValueError("count must be at least 1")
+
+    if platform.system() == "Windows":
+        command = ["ping", "-n", str(count), "-w", str(timeout_ms), target]
+    else:
+        timeout_seconds = max(1, round(timeout_ms / 1000))
+        command = ["ping", "-c", str(count), "-W", str(timeout_seconds), target]
+
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=max(5, count * ((timeout_ms / 1000) + 1)),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return NetworkPerformanceResult(None, None, error=str(exc))
+
+    output = f"{completed.stdout}\n{completed.stderr}"
+    if platform.system() == "Windows":
+        packet_match = re.search(
+            r"Sent = (\d+), Received = (\d+), Lost = \d+ \((\d+)% loss\)",
+            output,
+            re.IGNORECASE,
+        )
+        latency_match = re.search(r"Average = (\d+)ms", output, re.IGNORECASE)
+    else:
+        packet_match = re.search(
+            r"(\d+) packets transmitted, (\d+) (?:packets )?received,.*?"
+            r"(\d+(?:\.\d+)?)% packet loss",
+            output,
+            re.IGNORECASE,
+        )
+        latency_match = re.search(
+            r"(?:rtt|round-trip).*?= [\d.]+/([\d.]+)/",
+            output,
+            re.IGNORECASE,
+        )
+
+    if not packet_match:
+        return NetworkPerformanceResult(
+            None,
+            None,
+            error=f"Could not read ping results for {target}.",
+        )
+
+    packet_loss = float(packet_match.group(3))
+    average_latency = (
+        float(latency_match.group(1)) if latency_match is not None else None
+    )
+    if not include_speedtest:
+        return NetworkPerformanceResult(average_latency, packet_loss)
+
+    try:
+        import speedtest
+
+        client = speedtest.Speedtest(secure=True)
+        client.get_best_server()
+        download_mbps = client.download() / 1_000_000
+        upload_mbps = client.upload() / 1_000_000
+    except Exception as exc:
+        # Preserve the successful ICMP measurements when the active speed test fails.
+        return NetworkPerformanceResult(
+            average_latency,
+            packet_loss,
+            error=f"Speed test failed: {exc}",
+        )
+
+    return NetworkPerformanceResult(
+        average_latency_ms=average_latency,
+        packet_loss_percent=packet_loss,
+        speedtest_latency_ms=float(client.results.ping),
+        download_mbps=round(download_mbps, 2),
+        upload_mbps=round(upload_mbps, 2),
+    )
+
+
+@transaction.atomic
+def record_network_performance(
+    device: Device,
+    result: NetworkPerformanceResult,
+    collected_at=None,
+) -> dict[str, MetricRecord]:
+    """Store one set of network-performance measurements as metric records."""
+
+    collected_at = collected_at or timezone.now()
+    metric_specs = {
+        "internet_icmp_latency_ms": ("Internet ICMP latency", "ms", result.average_latency_ms),
+        "internet_packet_loss_percent": (
+            "Internet packet loss",
+            "%",
+            result.packet_loss_percent,
+        ),
+        "internet_speedtest_latency_ms": (
+            "Speedtest latency",
+            "ms",
+            result.speedtest_latency_ms,
+        ),
+        "internet_download_mbps": ("Internet download speed", "Mbps", result.download_mbps),
+        "internet_upload_mbps": ("Internet upload speed", "Mbps", result.upload_mbps),
+    }
+
+    records = {}
+    for key, (display_name, unit, value) in metric_specs.items():
+        definition, _ = MetricDefinition.objects.update_or_create(
+            key=key,
+            defaults={
+                "display_name": display_name,
+                "unit": unit,
+                "data_type": MetricDefinition.DataType.FLOAT,
+                "source_protocol": MetricDefinition.SourceProtocol.SYSTEM,
+                "oid": "",
+            },
+        )
+        records[key] = MetricRecord.objects.create(
+            device=device,
+            metric_definition=definition,
+            numeric_value=value,
+            text_value=result.error if value is None else "",
+            collected_at=collected_at,
+            collection_successful=value is not None,
+        )
+
+    return records
+
+
+def collect_network_performance(
+    device: Device,
+    target: str = "8.8.8.8",
+    count: int = 4,
+    include_speedtest: bool = True,
+) -> dict[str, MetricRecord]:
+    """Measure and store one network-performance sample."""
+
+    result = measure_network_performance(
+        target=target,
+        count=count,
+        include_speedtest=include_speedtest,
+    )
+    return record_network_performance(device, result)
 
 
 @transaction.atomic

@@ -18,11 +18,14 @@ from .models import (
 )
 from .services import (
     MemoryResult,
+    NetworkPerformanceResult,
     PingResult,
     SnmpResult,
+    collect_network_performance,
     poll_memory_usage,
     poll_system_uptime,
     record_availability_result,
+    record_network_performance,
     record_syslog_event,
 )
 from .rbac import MONITORING_USERS_GROUP, NETWORK_ADMINISTRATORS_GROUP
@@ -241,6 +244,131 @@ class SnmpPollingTests(TestCase):
             self.assertFalse(record.collection_successful)
             self.assertIsNone(record.numeric_value)
             self.assertEqual(record.text_value, "SNMP timeout")
+
+
+class NetworkPerformanceTests(TestCase):
+    def setUp(self):
+        self.device = Device.objects.create(
+            name="Performance Host",
+            ip_address="192.168.20.25",
+            device_type=Device.DeviceType.SERVER,
+            vlan_id=20,
+        )
+
+    def test_record_network_performance_stores_five_metrics(self):
+        result = NetworkPerformanceResult(
+            average_latency_ms=18.0,
+            packet_loss_percent=0.0,
+            speedtest_latency_ms=30.5,
+            download_mbps=300.25,
+            upload_mbps=40.75,
+        )
+
+        records = record_network_performance(self.device, result)
+
+        self.assertEqual(len(records), 5)
+        self.assertEqual(MetricRecord.objects.count(), 5)
+        self.assertEqual(
+            records["internet_download_mbps"].numeric_value,
+            300.25,
+        )
+        self.assertEqual(
+            records["internet_download_mbps"].metric_definition.unit,
+            "Mbps",
+        )
+        self.assertTrue(
+            all(record.collection_successful for record in records.values())
+        )
+
+    def test_speedtest_failure_preserves_successful_ping_metrics(self):
+        result = NetworkPerformanceResult(
+            average_latency_ms=20.0,
+            packet_loss_percent=25.0,
+            error="Speed test failed: unavailable",
+        )
+
+        records = record_network_performance(self.device, result)
+
+        self.assertTrue(records["internet_icmp_latency_ms"].collection_successful)
+        self.assertTrue(
+            records["internet_packet_loss_percent"].collection_successful
+        )
+        self.assertFalse(records["internet_download_mbps"].collection_successful)
+        self.assertIn(
+            "Speed test failed",
+            records["internet_download_mbps"].text_value,
+        )
+
+    @patch("monitoring.services.measure_network_performance")
+    def test_collect_network_performance_uses_measurement_service(self, mock_measure):
+        mock_measure.return_value = NetworkPerformanceResult(12.0, 0.0)
+
+        records = collect_network_performance(
+            self.device,
+            target="1.1.1.1",
+            count=3,
+            include_speedtest=False,
+        )
+
+        mock_measure.assert_called_once_with(
+            target="1.1.1.1",
+            count=3,
+            include_speedtest=False,
+        )
+        self.assertEqual(records["internet_icmp_latency_ms"].numeric_value, 12.0)
+
+    @patch("monitoring.management.commands.collect_network_performance.collect_network_performance")
+    def test_management_command_runs_one_collection(self, mock_collect):
+        result = NetworkPerformanceResult(10.0, 0.0)
+        mock_collect.return_value = record_network_performance(self.device, result)
+
+        call_command(
+            "collect_network_performance",
+            device=self.device.name,
+            target="8.8.8.8",
+            count=2,
+            ping_only=True,
+            verbosity=0,
+        )
+
+        mock_collect.assert_called_once_with(
+            device=self.device,
+            target="8.8.8.8",
+            count=2,
+            include_speedtest=False,
+        )
+
+    @patch(
+        "monitoring.management.commands.run_performance_monitor."
+        "collect_network_performance"
+    )
+    def test_continuous_performance_command_supports_one_collection(
+        self,
+        mock_collect,
+    ):
+        result = NetworkPerformanceResult(
+            average_latency_ms=15.0,
+            packet_loss_percent=0.0,
+            speedtest_latency_ms=25.0,
+            download_mbps=100.0,
+            upload_mbps=20.0,
+        )
+        mock_collect.return_value = record_network_performance(self.device, result)
+
+        call_command(
+            "run_performance_monitor",
+            device=self.device.name,
+            target="1.1.1.1",
+            interval=1,
+            once=True,
+            verbosity=0,
+        )
+
+        mock_collect.assert_called_once_with(
+            device=self.device,
+            target="1.1.1.1",
+            include_speedtest=True,
+        )
 
 
 class SyslogRecordingTests(TestCase):

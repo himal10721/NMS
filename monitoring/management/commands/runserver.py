@@ -17,8 +17,8 @@ class Command(DjangoRunserverCommand):
     """Run Django and the local monitoring commands from one terminal."""
 
     help = (
-        "Starts Django's development server and the ICMP, SNMP, and syslog "
-        "monitoring workers."
+        "Starts Django's development server and the ICMP, SNMP, syslog, and "
+        "internet-performance monitoring workers."
     )
 
     def add_arguments(self, parser):
@@ -67,6 +67,14 @@ class Command(DjangoRunserverCommand):
         snmp_interval = os.environ.get("NMS_SNMP_INTERVAL", "60")
         syslog_host = os.environ.get("NMS_SYSLOG_HOST", "0.0.0.0")
         syslog_port = os.environ.get("NMS_SYSLOG_PORT", "514")
+        performance_device = os.environ.get(
+            "NMS_PERFORMANCE_DEVICE",
+            "Monitoring PC",
+        )
+        performance_interval = os.environ.get(
+            "NMS_PERFORMANCE_INTERVAL",
+            "3600",
+        )
 
         commands = (
             ("ICMP monitor", ["run_monitor"]),
@@ -83,6 +91,16 @@ class Command(DjangoRunserverCommand):
             (
                 "Syslog listener",
                 ["run_syslog_listener", "--host", syslog_host, "--port", syslog_port],
+            ),
+            (
+                "Performance monitor",
+                [
+                    "run_performance_monitor",
+                    "--device",
+                    performance_device,
+                    "--interval",
+                    performance_interval,
+                ],
             ),
         )
 
