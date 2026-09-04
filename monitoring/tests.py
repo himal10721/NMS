@@ -1,3 +1,4 @@
+from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
 from django.contrib.auth import get_user_model
@@ -18,6 +19,7 @@ from .models import (
 )
 from .services import (
     MemoryResult,
+    InterfaceSample,
     NetworkPerformanceResult,
     PingResult,
     SnmpResult,
@@ -25,6 +27,8 @@ from .services import (
     poll_memory_usage,
     poll_system_uptime,
     record_availability_result,
+    record_cpu_usage,
+    record_interface_samples,
     record_network_performance,
     record_syslog_event,
 )
@@ -70,6 +74,10 @@ class AvailabilityRecordingTests(TestCase):
             self.device,
             PingResult(False, None, "Request timed out"),
         )
+        record_availability_result(
+            self.device,
+            PingResult(False, None, "Request timed out"),
+        )
         record_availability_result(self.device, PingResult(True, 3.5))
 
         self.device.refresh_from_db()
@@ -77,6 +85,14 @@ class AvailabilityRecordingTests(TestCase):
         self.assertEqual(self.device.last_status, Device.Status.UP)
         self.assertEqual(alert.status, Alert.Status.RESOLVED)
         self.assertIsNotNone(alert.resolved_at)
+
+    def test_single_failed_check_does_not_open_false_alarm(self):
+        record_availability_result(
+            self.device,
+            PingResult(False, None, "Request timed out"),
+        )
+
+        self.assertEqual(Alert.objects.count(), 0)
 
 
 class NetworkInterfaceModelTests(TestCase):
@@ -103,6 +119,37 @@ class NetworkInterfaceModelTests(TestCase):
         )
 
         self.assertEqual(device.interfaces.count(), 2)
+
+    def test_interface_samples_create_rates_and_failure_alert(self):
+        device = Device.objects.create(
+            name="R1-interface",
+            ip_address="192.168.10.21",
+            device_type=Device.DeviceType.ROUTER,
+            vlan_id=10,
+        )
+        first_at = timezone.now()
+        record_interface_samples(
+            device,
+            [InterfaceSample(1, "FastEthernet0/0", 1000, 1, 1, 1000, 2000)],
+            first_at,
+        )
+        record_interface_samples(
+            device,
+            [InterfaceSample(1, "FastEthernet0/0", 1000, 1, 2, 1600, 2600)],
+            first_at + timedelta(seconds=60),
+        )
+
+        interface = device.interfaces.get(interface_index=1)
+        inbound = MetricRecord.objects.filter(
+            interface=interface,
+            metric_definition__key="interface_in_bps",
+            collection_successful=True,
+        ).first()
+        self.assertEqual(interface.operational_status, NetworkInterface.Status.DOWN)
+        self.assertEqual(inbound.numeric_value, 80.0)
+        self.assertTrue(
+            Alert.objects.filter(message__startswith="[INTERFACE:1]").exists()
+        )
 
 
 class ExpandedDatabaseModelTests(TestCase):
@@ -245,6 +292,21 @@ class SnmpPollingTests(TestCase):
             self.assertIsNone(record.numeric_value)
             self.assertEqual(record.text_value, "SNMP timeout")
 
+    def test_cpu_usage_is_stored_and_generates_threshold_alert(self):
+        record = record_cpu_usage(self.device, SnmpResult(True, 7.0))
+
+        self.assertEqual(record.metric_definition.key, "cpu_usage_percent")
+        self.assertEqual(record.numeric_value, 7.0)
+        self.assertTrue(Alert.objects.filter(message__startswith="[CPU]").exists())
+
+        record_cpu_usage(self.device, SnmpResult(True, 0.5))
+        self.assertFalse(
+            Alert.objects.filter(
+                message__startswith="[CPU]",
+                status=Alert.Status.OPEN,
+            ).exists()
+        )
+
 
 class NetworkPerformanceTests(TestCase):
     def setUp(self):
@@ -297,6 +359,30 @@ class NetworkPerformanceTests(TestCase):
         self.assertIn(
             "Speed test failed",
             records["internet_download_mbps"].text_value,
+        )
+
+    def test_performance_threshold_alert_opens_and_resolves(self):
+        record_network_performance(
+            self.device,
+            NetworkPerformanceResult(150.0, 10.0),
+        )
+
+        self.assertEqual(
+            Alert.objects.filter(category=Alert.Category.PERFORMANCE).count(),
+            2,
+        )
+
+        record_network_performance(
+            self.device,
+            NetworkPerformanceResult(0.5, 0.0),
+        )
+
+        self.assertEqual(
+            Alert.objects.filter(
+                category=Alert.Category.PERFORMANCE,
+                status=Alert.Status.OPEN,
+            ).count(),
+            0,
         )
 
     @patch("monitoring.services.measure_network_performance")
@@ -401,6 +487,51 @@ class SyslogRecordingTests(TestCase):
         self.assertEqual(event.source_ip, "192.168.10.250")
         self.assertEqual(event.severity, "")
 
+    def test_three_failed_logins_from_one_source_raise_warning(self):
+        now = timezone.now()
+        for attempt in range(3):
+            record_syslog_event(
+                str(self.device.ip_address),
+                "<188>%SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] "
+                "[Source: 192.168.10.50] [localport: 22] "
+                "[Reason: Login Authentication Failed]",
+                received_at=now + timedelta(seconds=attempt * 10),
+            )
+
+        alert = Alert.objects.get(message__startswith="[BRUTE_FORCE:192.168.10.50]")
+        self.assertEqual(alert.severity, Alert.Severity.WARNING)
+        self.assertIn("3 failed login attempts", alert.message)
+
+    def test_five_failed_logins_escalate_one_alert_to_critical(self):
+        now = timezone.now()
+        for attempt in range(5):
+            record_syslog_event(
+                str(self.device.ip_address),
+                "%SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] "
+                "[Source: 192.168.10.51] [Reason: Login Authentication Failed]",
+                received_at=now + timedelta(seconds=attempt * 5),
+            )
+
+        alerts = Alert.objects.filter(message__startswith="[BRUTE_FORCE:192.168.10.51]")
+        self.assertEqual(alerts.count(), 1)
+        self.assertEqual(alerts.get().severity, Alert.Severity.CRITICAL)
+        self.assertIn("5 failed login attempts", alerts.get().message)
+
+    def test_failed_logins_from_different_sources_are_not_combined(self):
+        now = timezone.now()
+        for attempt, source in enumerate(
+            ("192.168.10.60", "192.168.10.61", "192.168.10.60")
+        ):
+            record_syslog_event(
+                str(self.device.ip_address),
+                f"%SEC_LOGIN-4-LOGIN_FAILED: Login failed [Source: {source}]",
+                received_at=now + timedelta(seconds=attempt),
+            )
+
+        self.assertFalse(
+            Alert.objects.filter(message__startswith="[BRUTE_FORCE:").exists()
+        )
+
 
 class DashboardTests(TestCase):
     def setUp(self):
@@ -440,6 +571,66 @@ class DashboardTests(TestCase):
         response = self.client.get(reverse("monitoring:dashboard"))
 
         self.assertNotContains(response, "Administration")
+
+    def test_dashboard_displays_latest_performance_metric(self):
+        device = Device.objects.create(
+            name="Monitoring PC",
+            ip_address="192.168.10.10",
+            device_type=Device.DeviceType.WORKSTATION,
+            vlan_id=10,
+        )
+        definition = MetricDefinition.objects.create(
+            key="internet_download_mbps",
+            display_name="Internet download speed",
+            unit="Mbps",
+            data_type=MetricDefinition.DataType.FLOAT,
+            source_protocol=MetricDefinition.SourceProtocol.SYSTEM,
+        )
+        MetricRecord.objects.create(
+            device=device,
+            metric_definition=definition,
+            numeric_value=48.09,
+            collected_at=timezone.now(),
+            collection_successful=True,
+        )
+
+        response = self.client.get(reverse("monitoring:dashboard"))
+
+        self.assertContains(response, "48.09")
+        self.assertContains(response, "Internet throughput")
+        self.assertEqual(
+            response.context["performance_metrics"][0]["record"].numeric_value,
+            48.09,
+        )
+
+    def test_dashboard_hides_stale_snmp_values_when_router_is_down(self):
+        router = Device.objects.create(
+            name="R1-down",
+            ip_address="192.168.10.1",
+            device_type=Device.DeviceType.ROUTER,
+            vlan_id=10,
+            last_status=Device.Status.DOWN,
+        )
+        definition = MetricDefinition.objects.create(
+            key="system_uptime",
+            display_name="System uptime",
+            unit="minutes",
+            data_type=MetricDefinition.DataType.FLOAT,
+            source_protocol=MetricDefinition.SourceProtocol.SNMP,
+        )
+        MetricRecord.objects.create(
+            device=router,
+            metric_definition=definition,
+            numeric_value=108,
+            collected_at=timezone.now(),
+            collection_successful=True,
+        )
+
+        response = self.client.get(reverse("monitoring:dashboard"))
+
+        self.assertIsNone(response.context["latest_uptime"])
+        self.assertContains(response, "Router uptime")
+        self.assertContains(response, "N/A")
 
 
 class AuthenticationFlowTests(TestCase):

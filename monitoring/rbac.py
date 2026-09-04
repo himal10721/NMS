@@ -3,8 +3,7 @@
 MONITORING_USERS_GROUP = "Monitoring Users"
 NETWORK_ADMINISTRATORS_GROUP = "Network Administrators"
 
-# Automatically collected history is read-only for both roles. Administrators
-# receive additional write access only to inventory and alert-management data.
+
 MONITORING_MODEL_NAMES = (
     "device",
     "networkinterface",

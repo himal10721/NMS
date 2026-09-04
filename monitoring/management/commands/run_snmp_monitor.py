@@ -4,7 +4,12 @@ import time
 from django.core.management.base import BaseCommand, CommandError
 
 from monitoring.models import Device
-from monitoring.services import poll_memory_usage, poll_system_uptime
+from monitoring.services import (
+    poll_cpu_usage,
+    poll_interfaces,
+    poll_memory_usage,
+    poll_system_uptime,
+)
 
 
 class Command(BaseCommand):
@@ -17,8 +22,8 @@ class Command(BaseCommand):
         parser.add_argument(
             "--interval",
             type=float,
-            default=60,
-            help="Seconds between collections (default: 60).",
+            default=10,
+            help="Seconds between collections (default: 10).",
         )
         parser.add_argument(
             "--community",
@@ -61,14 +66,28 @@ class Command(BaseCommand):
 
                 uptime = poll_system_uptime(device, community)
                 memory = poll_memory_usage(device, community)
+                cpu = poll_cpu_usage(device, community)
+                try:
+                    interfaces = poll_interfaces(device, community)
+                    interface_error = ""
+                except Exception as exc:
+                    # A failed IF-MIB walk must not stop uptime/RAM monitoring.
+                    interfaces = []
+                    interface_error = str(exc)
                 memory_percent = memory["memory_usage_percent"]
+                cpu_summary = (
+                    f"CPU {cpu.numeric_value:.2f}%"
+                    if cpu.collection_successful
+                    else "CPU unavailable"
+                )
 
                 if uptime.collection_successful and memory_percent.collection_successful:
                     self.stdout.write(
                         self.style.SUCCESS(
                             f"{device.name}: uptime {uptime.numeric_value:.2f} min; "
                             f"RAM {memory_percent.numeric_value:.2f}% "
-                            f"({memory['memory_used_mb'].numeric_value:.2f} MB used)"
+                            f"({memory['memory_used_mb'].numeric_value:.2f} MB used); "
+                            f"{cpu_summary}; interfaces {len(interfaces)}"
                         )
                     )
                 else:
@@ -80,6 +99,13 @@ class Command(BaseCommand):
                     self.stderr.write(
                         self.style.ERROR(
                             f"{device.name}: collection failed: " + "; ".join(errors)
+                        )
+                    )
+                if interface_error:
+                    self.stderr.write(
+                        self.style.ERROR(
+                            f"{device.name}: interface collection failed: "
+                            f"{interface_error}"
                         )
                     )
 

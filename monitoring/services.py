@@ -3,6 +3,7 @@ import platform
 import re
 import subprocess
 import time
+from datetime import timedelta
 from dataclasses import dataclass
 
 from django.db import transaction
@@ -15,6 +16,7 @@ from pysnmp.hlapi.v3arch.asyncio import (
     SnmpEngine,
     UdpTransportTarget,
     get_cmd,
+    walk_cmd,
 )
 
 from .models import (
@@ -24,12 +26,28 @@ from .models import (
     MetricDefinition,
     MetricRecord,
     NetworkEvent,
+    NetworkInterface,
 )
 
 
 SYS_UPTIME_OID = "1.3.6.1.2.1.1.3.0"
 CISCO_MEMORY_USED_OID = "1.3.6.1.4.1.9.9.48.1.1.1.5.1"
 CISCO_MEMORY_FREE_OID = "1.3.6.1.4.1.9.9.48.1.1.1.6.1"
+CISCO_CPU_5SEC_REV_OID = "1.3.6.1.4.1.9.9.109.1.1.1.1.6"
+CISCO_CPU_5SEC_LEGACY_OID = "1.3.6.1.4.1.9.9.109.1.1.1.1.3"
+IF_DESCR_OID = "1.3.6.1.2.1.2.2.1.2"
+IF_SPEED_OID = "1.3.6.1.2.1.2.2.1.5"
+IF_ADMIN_STATUS_OID = "1.3.6.1.2.1.2.2.1.7"
+IF_OPER_STATUS_OID = "1.3.6.1.2.1.2.2.1.8"
+IF_IN_OCTETS_OID = "1.3.6.1.2.1.2.2.1.10"
+IF_OUT_OCTETS_OID = "1.3.6.1.2.1.2.2.1.16"
+# Deliberately low demonstration thresholds. Restore these to 100 ms, 5%, and
+# 80% respectively after alert screenshots and acceptance testing are complete.
+LATENCY_WARNING_MS = 1.0
+PACKET_LOSS_WARNING_PERCENT = 0.0
+INTERFACE_UTILIZATION_WARNING_PERCENT = 0.01
+CPU_WARNING_PERCENT = 1.0
+AVAILABILITY_FAILURE_CONFIRMATIONS = 2
 
 SYSLOG_SEVERITIES = {
     0: "emergency",
@@ -41,6 +59,22 @@ SYSLOG_SEVERITIES = {
     6: "informational",
     7: "debug",
 }
+
+BRUTE_FORCE_WINDOW_SECONDS = 60
+BRUTE_FORCE_WARNING_ATTEMPTS = 3
+BRUTE_FORCE_CRITICAL_ATTEMPTS = 5
+BRUTE_FORCE_ALERT_PREFIX = "[BRUTE_FORCE:"
+LOGIN_FAILURE_MARKERS = (
+    "%SEC_LOGIN-4-LOGIN_FAILED",
+    "login authentication failed",
+    "authentication failed",
+    "failed password",
+)
+LOGIN_SOURCE_PATTERNS = (
+    re.compile(r"\[Source:\s*([^\]\s]+)", re.IGNORECASE),
+    re.compile(r"from\s+(\d{1,3}(?:\.\d{1,3}){3})", re.IGNORECASE),
+    re.compile(r"source(?:=|:)\s*(\d{1,3}(?:\.\d{1,3}){3})", re.IGNORECASE),
+)
 
 
 @dataclass(frozen=True)
@@ -92,6 +126,19 @@ class NetworkPerformanceResult:
     download_mbps: float | None = None
     upload_mbps: float | None = None
     error: str = ""
+
+
+@dataclass(frozen=True)
+class InterfaceSample:
+    """Values collected for one IF-MIB interface row."""
+
+    interface_index: int
+    name: str
+    speed_bps: int
+    admin_status: int
+    operational_status: int
+    in_octets: int
+    out_octets: int
 
 
 async def fetch_snmp_timeticks(
@@ -178,6 +225,98 @@ async def fetch_memory_usage(
         return MemoryResult(False, None, None, f"Invalid memory value: {exc}")
 
     return MemoryResult(True, used_bytes, free_bytes)
+
+
+async def _walk_snmp_column(
+    ip_address: str,
+    community: str,
+    oid: str,
+    timeout_seconds: int = 2,
+) -> dict[int, object]:
+    """Walk one numeric IF-MIB column and return values keyed by row index."""
+    transport = await UdpTransportTarget.create(
+        (ip_address, 161), timeout=timeout_seconds, retries=1
+    )
+    values = {}
+    async for error_indication, error_status, error_index, var_binds in walk_cmd(
+        SnmpEngine(),
+        CommunityData(community, mpModel=1),
+        transport,
+        ContextData(),
+        ObjectType(ObjectIdentity(oid)),
+        lexicographicMode=False,
+        lookupMib=False,
+    ):
+        if error_indication:
+            raise RuntimeError(str(error_indication))
+        if error_status:
+            raise RuntimeError(f"{error_status.prettyPrint()} at index {error_index}")
+        for variable, value in var_binds:
+            index = int(variable.prettyPrint().split(".")[-1])
+            values[index] = value
+    return values
+
+
+async def fetch_interface_samples(
+    ip_address: str,
+    community: str,
+    timeout_seconds: int = 2,
+) -> list[InterfaceSample]:
+    """Collect interface identity, status and octet counters through IF-MIB."""
+    columns = {}
+    for name, oid in {
+        "description": IF_DESCR_OID,
+        "speed": IF_SPEED_OID,
+        "admin": IF_ADMIN_STATUS_OID,
+        "operational": IF_OPER_STATUS_OID,
+        "in_octets": IF_IN_OCTETS_OID,
+        "out_octets": IF_OUT_OCTETS_OID,
+    }.items():
+        columns[name] = await _walk_snmp_column(
+            ip_address, community, oid, timeout_seconds
+        )
+
+    samples = []
+    for index, description in columns["description"].items():
+        if not all(index in columns[name] for name in columns if name != "description"):
+            continue
+        samples.append(
+            InterfaceSample(
+                interface_index=index,
+                name=description.prettyPrint(),
+                speed_bps=int(columns["speed"][index]),
+                admin_status=int(columns["admin"][index]),
+                operational_status=int(columns["operational"][index]),
+                in_octets=int(columns["in_octets"][index]),
+                out_octets=int(columns["out_octets"][index]),
+            )
+        )
+    return samples
+
+
+async def fetch_cpu_usage(
+    ip_address: str,
+    community: str,
+    timeout_seconds: int = 2,
+) -> SnmpResult:
+    """Retrieve Cisco five-second CPU utilisation, with legacy fallback."""
+    errors = []
+    for oid in (CISCO_CPU_5SEC_REV_OID, CISCO_CPU_5SEC_LEGACY_OID):
+        try:
+            values = await _walk_snmp_column(
+                ip_address, community, oid, timeout_seconds
+            )
+            if values:
+                # Multi-CPU devices expose multiple rows; report the busiest CPU.
+                return SnmpResult(True, float(max(int(value) for value in values.values())))
+        except Exception as exc:
+            errors.append(str(exc))
+    return SnmpResult(
+        False,
+        None,
+        "; ".join(error for error in errors if error)
+        or "Cisco CPU OID returned no values.",
+    )
 
 
 def ping_device(ip_address: str, timeout_seconds: int = 2) -> PingResult:
@@ -345,7 +484,59 @@ def record_network_performance(
             collection_successful=value is not None,
         )
 
+    _synchronize_threshold_alert(
+        device,
+        "[LATENCY]",
+        result.average_latency_ms is not None
+        and result.average_latency_ms >= LATENCY_WARNING_MS,
+        f"[LATENCY] Internet latency is {result.average_latency_ms:.2f} ms "
+        f"(threshold {LATENCY_WARNING_MS:.0f} ms)."
+        if result.average_latency_ms is not None
+        else "[LATENCY] Internet latency threshold exceeded.",
+        collected_at,
+    )
+    _synchronize_threshold_alert(
+        device,
+        "[PACKET LOSS]",
+        result.packet_loss_percent is not None
+        and result.packet_loss_percent > PACKET_LOSS_WARNING_PERCENT,
+        f"[PACKET LOSS] Internet packet loss is {result.packet_loss_percent:.2f}% "
+        f"(threshold {PACKET_LOSS_WARNING_PERCENT:.0f}%)."
+        if result.packet_loss_percent is not None
+        else "[PACKET LOSS] Internet packet-loss threshold exceeded.",
+        collected_at,
+    )
+
     return records
+
+
+def _synchronize_threshold_alert(
+    device: Device,
+    message_prefix: str,
+    breached: bool,
+    message: str,
+    observed_at,
+    category=Alert.Category.PERFORMANCE,
+    severity=Alert.Severity.WARNING,
+) -> None:
+    """Open one threshold alert while breached and resolve it after recovery."""
+    existing = Alert.objects.filter(
+        device=device,
+        status=Alert.Status.OPEN,
+        message__startswith=message_prefix,
+    )
+    if breached:
+        if not existing.exists():
+            Alert.objects.create(
+                device=device,
+                category=category,
+                severity=severity,
+                status=Alert.Status.OPEN,
+                message=message,
+                opened_at=observed_at,
+            )
+    else:
+        existing.update(status=Alert.Status.RESOLVED, resolved_at=observed_at)
 
 
 def collect_network_performance(
@@ -373,6 +564,7 @@ def record_availability_result(
     """Persist a poll result and apply outage/recovery state transitions."""
     checked_at = checked_at or timezone.now()
     previous_status = device.last_status
+    previous_check = device.availability_checks.first()
     current_status = Device.Status.UP if result.is_reachable else Device.Status.DOWN
 
     check = AvailabilityCheck.objects.create(
@@ -395,13 +587,29 @@ def record_availability_result(
         ]
     )
 
-    # Open only one alert when the state first changes to DOWN. Repeated failed
-    # polls remain in AvailabilityCheck history without causing alert flooding.
-    if current_status == Device.Status.DOWN and previous_status != Device.Status.DOWN:
+    # Require two consecutive failures before opening an outage alert. The
+    # device state changes immediately, but a single transient loss does not
+    # create an operator alarm.
+    failure_confirmed = (
+        current_status == Device.Status.DOWN
+        and previous_check is not None
+        and not previous_check.is_reachable
+    )
+    has_open_outage = Alert.objects.filter(
+        device=device,
+        category=Alert.Category.AVAILABILITY,
+        status=Alert.Status.OPEN,
+    ).exists()
+    if failure_confirmed and not has_open_outage:
         Alert.objects.create(
             device=device,
+            category=Alert.Category.AVAILABILITY,
+            severity=Alert.Severity.CRITICAL,
             status=Alert.Status.OPEN,
-            message=f"{device.name} is unreachable at {device.ip_address}.",
+            message=(
+                f"{device.name} is unreachable at {device.ip_address} after "
+                f"{AVAILABILITY_FAILURE_CONFIRMATIONS} consecutive checks."
+            ),
             opened_at=checked_at,
         )
     # A successful poll following a DOWN state resolves every open outage alert
@@ -410,6 +618,7 @@ def record_availability_result(
         # resolve any open outage alerts for this device after recovery
         Alert.objects.filter(
             device=device,
+            category=Alert.Category.AVAILABILITY,
             status=Alert.Status.OPEN,
         ).update(
             status=Alert.Status.RESOLVED,
@@ -540,6 +749,183 @@ def poll_memory_usage(device: Device, community: str) -> dict[str, MetricRecord]
     return record_memory_usage(device, result)
 
 
+@transaction.atomic
+def record_cpu_usage(
+    device: Device,
+    result: SnmpResult,
+    collected_at=None,
+) -> MetricRecord:
+    """Store Cisco five-second CPU utilisation and synchronize its alert."""
+    collected_at = collected_at or timezone.now()
+    definition, _ = MetricDefinition.objects.update_or_create(
+        key="cpu_usage_percent",
+        defaults={
+            "display_name": "CPU usage (5-second average)",
+            "unit": "%",
+            "data_type": MetricDefinition.DataType.FLOAT,
+            "source_protocol": MetricDefinition.SourceProtocol.SNMP,
+            "oid": CISCO_CPU_5SEC_REV_OID,
+        },
+    )
+    record = MetricRecord.objects.create(
+        device=device,
+        metric_definition=definition,
+        numeric_value=result.value,
+        text_value=result.error,
+        collected_at=collected_at,
+        collection_successful=result.successful,
+    )
+    if result.successful and result.value is not None:
+        _synchronize_threshold_alert(
+            device,
+            "[CPU]",
+            result.value >= CPU_WARNING_PERCENT,
+            f"[CPU] Five-second CPU utilisation is {result.value:.2f}% "
+            f"(threshold {CPU_WARNING_PERCENT:.2f}%).",
+            collected_at,
+        )
+    return record
+
+
+def poll_cpu_usage(device: Device, community: str) -> MetricRecord:
+    """Retrieve and store Cisco five-second CPU utilisation."""
+    result = asyncio.run(fetch_cpu_usage(str(device.ip_address), community))
+    return record_cpu_usage(device, result)
+
+
+def _interface_status(value: int) -> str:
+    return {
+        1: NetworkInterface.Status.UP,
+        2: NetworkInterface.Status.DOWN,
+        3: NetworkInterface.Status.TESTING,
+    }.get(value, NetworkInterface.Status.UNKNOWN)
+
+
+@transaction.atomic
+def record_interface_samples(
+    device: Device,
+    samples: list[InterfaceSample],
+    collected_at=None,
+) -> list[NetworkInterface]:
+    """Upsert interfaces, calculate traffic rates and synchronize alerts."""
+    collected_at = collected_at or timezone.now()
+    definitions = {}
+    for key, display_name, unit, oid in (
+        ("interface_in_octets", "Interface inbound counter", "octets", IF_IN_OCTETS_OID),
+        ("interface_out_octets", "Interface outbound counter", "octets", IF_OUT_OCTETS_OID),
+        ("interface_in_bps", "Interface inbound throughput", "bps", IF_IN_OCTETS_OID),
+        ("interface_out_bps", "Interface outbound throughput", "bps", IF_OUT_OCTETS_OID),
+        ("interface_utilization_percent", "Interface utilisation", "%", IF_SPEED_OID),
+    ):
+        definitions[key], _ = MetricDefinition.objects.update_or_create(
+            key=key,
+            defaults={
+                "display_name": display_name,
+                "unit": unit,
+                "data_type": MetricDefinition.DataType.FLOAT,
+                "source_protocol": MetricDefinition.SourceProtocol.SNMP,
+                "oid": oid,
+            },
+        )
+
+    interfaces = []
+    for sample in samples:
+        interface, _ = NetworkInterface.objects.update_or_create(
+            device=device,
+            interface_index=sample.interface_index,
+            defaults={
+                "name": sample.name,
+                "admin_status": _interface_status(sample.admin_status),
+                "operational_status": _interface_status(sample.operational_status),
+            },
+        )
+        interfaces.append(interface)
+
+        rates = {}
+        for direction, counter in (("in", sample.in_octets), ("out", sample.out_octets)):
+            counter_definition = definitions[f"interface_{direction}_octets"]
+            previous = MetricRecord.objects.filter(
+                device=device,
+                interface=interface,
+                metric_definition=counter_definition,
+                collection_successful=True,
+                numeric_value__isnull=False,
+            ).first()
+            rate = None
+            if previous and counter >= previous.numeric_value:
+                seconds = (collected_at - previous.collected_at).total_seconds()
+                if seconds > 0:
+                    rate = round((counter - previous.numeric_value) * 8 / seconds, 2)
+            MetricRecord.objects.create(
+                device=device,
+                interface=interface,
+                metric_definition=counter_definition,
+                numeric_value=counter,
+                collected_at=collected_at,
+                collection_successful=True,
+            )
+            MetricRecord.objects.create(
+                device=device,
+                interface=interface,
+                metric_definition=definitions[f"interface_{direction}_bps"],
+                numeric_value=rate,
+                text_value="A second sample is required." if rate is None else "",
+                collected_at=collected_at,
+                collection_successful=rate is not None,
+            )
+            rates[direction] = rate
+
+        utilization = None
+        valid_rates = [rate for rate in rates.values() if rate is not None]
+        if sample.speed_bps > 0 and valid_rates:
+            utilization = round(max(valid_rates) * 100 / sample.speed_bps, 2)
+        MetricRecord.objects.create(
+            device=device,
+            interface=interface,
+            metric_definition=definitions["interface_utilization_percent"],
+            numeric_value=utilization,
+            text_value="A second sample is required." if utilization is None else "",
+            collected_at=collected_at,
+            collection_successful=utilization is not None,
+        )
+
+        interface_prefix = f"[INTERFACE:{sample.interface_index}]"
+        interface_down = (
+            interface.admin_status == NetworkInterface.Status.UP
+            and interface.operational_status == NetworkInterface.Status.DOWN
+        )
+        _synchronize_threshold_alert(
+            device,
+            interface_prefix,
+            interface_down,
+            f"{interface_prefix} {interface.name} is operationally down.",
+            collected_at,
+            category=Alert.Category.NETWORK_EVENT,
+            severity=Alert.Severity.CRITICAL,
+        )
+        utilization_prefix = f"[BANDWIDTH:{sample.interface_index}]"
+        _synchronize_threshold_alert(
+            device,
+            utilization_prefix,
+            utilization is not None
+            and utilization > INTERFACE_UTILIZATION_WARNING_PERCENT,
+            f"{utilization_prefix} {interface.name} utilisation is "
+            f"{utilization:.2f}% (threshold {INTERFACE_UTILIZATION_WARNING_PERCENT:.0f}%)."
+            if utilization is not None
+            else f"{utilization_prefix} Interface utilisation threshold exceeded.",
+            collected_at,
+        )
+    return interfaces
+
+
+def poll_interfaces(device: Device, community: str) -> list[NetworkInterface]:
+    """Retrieve IF-MIB data and persist interface status and traffic rates."""
+    samples = asyncio.run(
+        fetch_interface_samples(str(device.ip_address), community)
+    )
+    return record_interface_samples(device, samples)
+
+
 def get_syslog_severity(message: str) -> str:
     """Extract the severity from a leading syslog PRI value such as <189>."""
 
@@ -560,6 +946,76 @@ def get_syslog_severity(message: str) -> str:
     return SYSLOG_SEVERITIES[priority % 8]
 
 
+def _failed_login_source(message: str) -> str | None:
+    """Return the client address from a recognised failed-login syslog event."""
+    lowered = message.lower()
+    if not any(marker.lower() in lowered for marker in LOGIN_FAILURE_MARKERS):
+        return None
+    for pattern in LOGIN_SOURCE_PATTERNS:
+        match = pattern.search(message)
+        if match:
+            return match.group(1)
+    return "unknown"
+
+
+def detect_brute_force_attempt(event: NetworkEvent) -> Alert | None:
+    """Raise or escalate an alert for repeated failed logins from one source."""
+    if event.device is None:
+        return None
+
+    login_source = _failed_login_source(event.message)
+    if login_source is None:
+        return None
+
+    window_start = event.received_at - timedelta(seconds=BRUTE_FORCE_WINDOW_SECONDS)
+    recent_events = NetworkEvent.objects.filter(
+        device=event.device,
+        protocol=NetworkEvent.Protocol.SYSLOG,
+        received_at__gte=window_start,
+        received_at__lte=event.received_at,
+    )
+    attempts = sum(
+        1
+        for candidate in recent_events.only("message")
+        if _failed_login_source(candidate.message) == login_source
+    )
+    if attempts < BRUTE_FORCE_WARNING_ATTEMPTS:
+        return None
+
+    severity = (
+        Alert.Severity.CRITICAL
+        if attempts >= BRUTE_FORCE_CRITICAL_ATTEMPTS
+        else Alert.Severity.WARNING
+    )
+    prefix = f"{BRUTE_FORCE_ALERT_PREFIX}{login_source}]"
+    message = (
+        f"{prefix} Potential brute-force attack: {attempts} failed login attempts "
+        f"from {login_source} within {BRUTE_FORCE_WINDOW_SECONDS} seconds."
+    )
+    alert = Alert.objects.filter(
+        device=event.device,
+        category=Alert.Category.NETWORK_EVENT,
+        status=Alert.Status.OPEN,
+        message__startswith=prefix,
+    ).first()
+    if alert is None:
+        return Alert.objects.create(
+            device=event.device,
+            network_event=event,
+            category=Alert.Category.NETWORK_EVENT,
+            severity=severity,
+            status=Alert.Status.OPEN,
+            message=message,
+            opened_at=event.received_at,
+        )
+
+    alert.network_event = event
+    alert.severity = severity
+    alert.message = message
+    alert.save(update_fields=["network_event", "severity", "message"])
+    return alert
+
+
 def record_syslog_event(
     source_ip: str,
     message: str,
@@ -568,7 +1024,7 @@ def record_syslog_event(
     """Match a syslog sender to a device and store its message through Django."""
 
     device = Device.objects.filter(ip_address=source_ip).first()
-    return NetworkEvent.objects.create(
+    event = NetworkEvent.objects.create(
         device=device,
         source_ip=source_ip,
         protocol=NetworkEvent.Protocol.SYSLOG,
@@ -576,3 +1032,5 @@ def record_syslog_event(
         message=message or "<empty message>",
         received_at=received_at or timezone.now(),
     )
+    detect_brute_force_attempt(event)
+    return event

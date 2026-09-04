@@ -3,7 +3,12 @@ import os
 from django.core.management.base import BaseCommand, CommandError
 
 from monitoring.models import Device
-from monitoring.services import poll_memory_usage, poll_system_uptime
+from monitoring.services import (
+    poll_cpu_usage,
+    poll_interfaces,
+    poll_memory_usage,
+    poll_system_uptime,
+)
 
 
 class Command(BaseCommand):
@@ -41,6 +46,14 @@ class Command(BaseCommand):
             )
 
         memory_records = poll_memory_usage(device, community)
+        cpu_record = poll_cpu_usage(device, community)
+        try:
+            interfaces = poll_interfaces(device, community)
+        except Exception as exc:
+            interfaces = []
+            self.stderr.write(
+                self.style.ERROR(f"{device.name}: interface collection failed: {exc}")
+            )
         memory_percent = memory_records["memory_usage_percent"]
         if not memory_percent.collection_successful:
             raise CommandError(
@@ -50,12 +63,18 @@ class Command(BaseCommand):
 
         uptime_minutes = uptime_record.numeric_value
         uptime_hours = uptime_minutes / 60
+        cpu_summary = (
+            f"{cpu_record.numeric_value:.2f}%"
+            if cpu_record.collection_successful
+            else "unavailable"
+        )
         self.stdout.write(
             self.style.SUCCESS(
                 f"{device.name}: uptime = {uptime_minutes:.2f} minutes "
                 f"({uptime_hours:.2f} hours); "
                 f"RAM used = {memory_records['memory_used_mb'].numeric_value:.2f} MB; "
                 f"RAM free = {memory_records['memory_free_mb'].numeric_value:.2f} MB; "
-                f"RAM usage = {memory_percent.numeric_value:.2f}%"
+                f"RAM usage = {memory_percent.numeric_value:.2f}%; "
+                f"CPU = {cpu_summary}; interfaces discovered = {len(interfaces)}"
             )
         )

@@ -64,7 +64,7 @@ class Command(DjangoRunserverCommand):
 
         manage_py = Path(settings.BASE_DIR) / "manage.py"
         device_name = os.environ.get("NMS_SNMP_DEVICE", "R1")
-        snmp_interval = os.environ.get("NMS_SNMP_INTERVAL", "60")
+        snmp_interval = os.environ.get("NMS_SNMP_INTERVAL", "10")
         syslog_host = os.environ.get("NMS_SYSLOG_HOST", "0.0.0.0")
         syslog_port = os.environ.get("NMS_SYSLOG_PORT", "514")
         performance_device = os.environ.get(
