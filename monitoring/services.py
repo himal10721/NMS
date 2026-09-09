@@ -1,10 +1,14 @@
 import asyncio
+import os
 import platform
 import re
 import subprocess
 import time
 from datetime import timedelta
 from dataclasses import dataclass
+
+import paramiko
+from django.core.exceptions import PermissionDenied
 
 from django.db import transaction
 from django.utils import timezone
@@ -74,6 +78,63 @@ LOGIN_SOURCE_PATTERNS = (
     re.compile(r"\[Source:\s*([^\]\s]+)", re.IGNORECASE),
     re.compile(r"from\s+(\d{1,3}(?:\.\d{1,3}){3})", re.IGNORECASE),
     re.compile(r"source(?:=|:)\s*(\d{1,3}(?:\.\d{1,3}){3})", re.IGNORECASE),
+)
+
+APPROVED_SSH_COMMANDS = {
+    "show_version": ("Show software version", ("show version",), False),
+    "show_ip_interface_brief": (
+        "Show IP interface summary",
+        ("show ip interface brief",),
+        False,
+    ),
+    "show_interfaces": ("Show interface details", ("show interfaces",), False),
+    "show_ip_route": ("Show IP routing table", ("show ip route",), False),
+    "show_ssh_status": ("Show SSH status", ("show ip ssh",), False),
+    "enable_login_logging": (
+        "Enable successful and failed login logging",
+        (
+            "configure terminal",
+            "login on-failure log",
+            "login on-success log",
+            "end",
+            "write memory",
+        ),
+        True,
+    ),
+    "apply_ssh_security": (
+        "Apply SSH timeout and retry limits",
+        (
+            "configure terminal",
+            "ip ssh time-out 60",
+            "ip ssh authentication-retries 3",
+            "end",
+            "write memory",
+        ),
+        True,
+    ),
+}
+SSH_OUTPUT_LIMIT = 50_000
+SSH_ERROR_MARKERS = (
+    "% invalid input",
+    "% incomplete command",
+    "% ambiguous command",
+    "% authorization failed",
+    "% unknown command",
+    "invalid autocommand",
+    "unrecognized command",
+)
+SSH_BLOCKED_COMMAND = re.compile(
+    r"^(?:do\s+)?(?:reload|erase(?:\s|$)|write\s+erase|delete(?:\s|$)|"
+    r"format(?:\s|$)|factory-reset(?:\s|$))",
+    re.IGNORECASE,
+)
+SSH_OPERATIONAL_COMMAND = re.compile(
+    r"^(?:show|sho|sh|ping|traceroute)\s|^write\s+memory$|"
+    r"^copy\s+running-config\s+startup-config$",
+    re.IGNORECASE,
+)
+SSH_SENSITIVE_VALUE = re.compile(
+    r"\b(secret|password|community)\s+(?:[05789]\s+)?\S+", re.IGNORECASE
 )
 
 
@@ -1034,3 +1095,183 @@ def record_syslog_event(
     )
     detect_brute_force_attempt(event)
     return event
+
+
+def execute_approved_ssh_command(device: Device, command_key: str, user):
+    """Execute one fixed, allowlisted SSH action and persist its audit record."""
+    command_spec = APPROVED_SSH_COMMANDS.get(command_key)
+    if command_spec is None:
+        raise ValueError("The requested SSH command is not approved.")
+    _label, commands, requires_shell = command_spec
+    return _execute_ssh_action(
+        device=device,
+        user=user,
+        command_key=command_key,
+        commands=commands,
+        requires_shell=requires_shell,
+        audit_command=" ; ".join(commands),
+    )
+
+
+def execute_remote_ssh_command(device: Device, command_text: str, user):
+    """Execute an administrator-supplied Cisco command with safety controls."""
+    if not user.has_perm("monitoring.execute_ssh_command"):
+        raise PermissionDenied("This account cannot execute SSH commands.")
+
+    command_text = command_text.strip()
+    if not command_text:
+        raise ValueError("Enter a command to execute.")
+    if len(command_text) > 200:
+        raise ValueError("The command must not exceed 200 characters.")
+    if any(character in command_text for character in "\r\n\x00"):
+        raise ValueError("Enter commands on one line and separate steps with semicolons.")
+
+    commands = tuple(part.strip() for part in command_text.split(";") if part.strip())
+    if not commands:
+        raise ValueError("Enter a command to execute.")
+    if any(SSH_BLOCKED_COMMAND.search(command) for command in commands):
+        raise ValueError("Destructive reload, erase, delete and format commands are blocked.")
+
+    requires_shell = len(commands) > 1 or not SSH_OPERATIONAL_COMMAND.search(commands[0])
+    if requires_shell:
+        if commands[0].lower() in ("configure terminal", "conf t"):
+            commands = commands[1:]
+        if not commands:
+            raise ValueError("Enter a configuration command after configure terminal.")
+        shell_commands = ("configure terminal", *commands)
+        if commands[-1].lower() != "end":
+            shell_commands += ("end",)
+        shell_commands += ("write memory",)
+        commands = shell_commands
+
+    audit_command = SSH_SENSITIVE_VALUE.sub(r"\1 <redacted>", command_text)
+    return _execute_ssh_action(
+        device=device,
+        user=user,
+        command_key="custom",
+        commands=commands,
+        requires_shell=requires_shell,
+        audit_command=audit_command,
+    )
+
+
+def _execute_ssh_action(
+    *, device: Device, user, command_key: str, commands: tuple[str, ...],
+    requires_shell: bool, audit_command: str
+):
+    """Connect, execute a validated action and create its immutable audit row."""
+    from .models import SSHCommandLog
+
+    if not user.has_perm("monitoring.execute_ssh_command"):
+        raise PermissionDenied("This account cannot execute SSH commands.")
+
+    username = os.environ.get("NMS_SSH_USERNAME", "").strip()
+    key_path = os.environ.get("NMS_SSH_KEY_PATH", "").strip()
+    password = os.environ.get("NMS_SSH_PASSWORD", "")
+    known_hosts = os.environ.get("NMS_SSH_KNOWN_HOSTS", "").strip()
+    port_text = os.environ.get("NMS_SSH_PORT", "22")
+    if not username or not known_hosts or not (password or key_path):
+        error = (
+            "SSH is not configured. Set NMS_SSH_USERNAME, NMS_SSH_KNOWN_HOSTS "
+            "and either NMS_SSH_PASSWORD or NMS_SSH_KEY_PATH."
+        )
+        return SSHCommandLog.objects.create(
+            device=device,
+            user=user,
+            command_key=command_key,
+            command=audit_command,
+            successful=False,
+            error=error,
+        )
+    try:
+        port = int(port_text)
+        if not 1 <= port <= 65535:
+            raise ValueError
+    except ValueError:
+        return SSHCommandLog.objects.create(
+            device=device,
+            user=user,
+            command_key=command_key,
+            command=audit_command,
+            successful=False,
+            error="NMS_SSH_PORT must be a number between 1 and 65535.",
+        )
+
+    client = paramiko.SSHClient()
+    try:
+        client.load_host_keys(known_hosts)
+        client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        connection_options = {
+            "hostname": str(device.ip_address),
+            "port": port,
+            "username": username,
+            "look_for_keys": False,
+            "allow_agent": False,
+            "timeout": 8,
+            "banner_timeout": 8,
+            "auth_timeout": 8,
+        }
+        if password:
+            connection_options["password"] = password
+        else:
+            connection_options["pkey"] = paramiko.RSAKey.from_private_key_file(
+                key_path
+            )
+            # Older IOS releases accept ssh-rsa but not RSA/SHA-2 signatures.
+            connection_options["disabled_algorithms"] = {
+                "pubkeys": ["rsa-sha2-512", "rsa-sha2-256"],
+            }
+        client.connect(**connection_options)
+        if requires_shell:
+            channel = client.invoke_shell(width=160, height=1000)
+            time.sleep(0.3)
+            if channel.recv_ready():
+                channel.recv(SSH_OUTPUT_LIMIT)
+            for item in ("terminal length 0", *commands):
+                channel.send(item + "\n")
+                time.sleep(0.4)
+            chunks = []
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if channel.recv_ready():
+                    chunks.append(channel.recv(4096))
+                    deadline = min(deadline, time.monotonic() + 0.8)
+                else:
+                    time.sleep(0.1)
+            output = b"".join(chunks)[:SSH_OUTPUT_LIMIT].decode(
+                "utf-8", errors="replace"
+            )
+            error = ""
+            lowered_output = output.lower()
+            successful = not any(
+                marker in lowered_output for marker in SSH_ERROR_MARKERS
+            )
+        else:
+            _stdin, stdout, stderr = client.exec_command(commands[0], timeout=15)
+            output = stdout.read(SSH_OUTPUT_LIMIT).decode("utf-8", errors="replace")
+            error = stderr.read(SSH_OUTPUT_LIMIT).decode("utf-8", errors="replace")
+            exit_status = stdout.channel.recv_exit_status()
+            combined_response = f"{output}\n{error}".lower()
+            successful = (
+                exit_status == 0
+                and not error.strip()
+                and not any(
+                    marker in combined_response for marker in SSH_ERROR_MARKERS
+                )
+            )
+    except Exception as exc:
+        output = ""
+        error = str(exc)
+        successful = False
+    finally:
+        client.close()
+
+    return SSHCommandLog.objects.create(
+        device=device,
+        user=user,
+        command_key=command_key,
+        command=audit_command,
+        successful=successful,
+        output=output,
+        error=error,
+    )

@@ -18,4 +18,6 @@ ADMINISTRATOR_WRITE_PERMISSIONS = (
     "add_device",
     "change_device",
     "change_alert",
+    "view_sshcommandlog",
+    "execute_ssh_command",
 )

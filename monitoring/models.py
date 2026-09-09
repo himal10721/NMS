@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 
@@ -265,3 +266,33 @@ class Alert(models.Model):
 
     def __str__(self) -> str:
         return f"{self.device.name}: {self.status}"
+
+
+class SSHCommandLog(models.Model):
+    """Immutable audit record for an approved command executed over SSH."""
+
+    device = models.ForeignKey(
+        Device,
+        on_delete=models.PROTECT,
+        related_name="ssh_command_logs",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="ssh_command_logs",
+    )
+    command_key = models.CharField(max_length=50)
+    command = models.CharField(max_length=200)
+    successful = models.BooleanField(default=False)
+    output = models.TextField(blank=True)
+    error = models.TextField(blank=True)
+    executed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-executed_at"]
+        permissions = [
+            ("execute_ssh_command", "Can execute approved SSH commands"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.user}: {self.device.name} - {self.command_key}"

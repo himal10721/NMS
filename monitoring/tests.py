@@ -1,8 +1,9 @@
 from datetime import timedelta
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
+from django.core.exceptions import PermissionDenied
 from django.core.management import call_command
 from django.test import TestCase
 from django.urls import reverse
@@ -16,6 +17,7 @@ from .models import (
     MetricRecord,
     NetworkEvent,
     NetworkInterface,
+    SSHCommandLog,
 )
 from .services import (
     MemoryResult,
@@ -24,6 +26,8 @@ from .services import (
     PingResult,
     SnmpResult,
     collect_network_performance,
+    execute_approved_ssh_command,
+    execute_remote_ssh_command,
     poll_memory_usage,
     poll_system_uptime,
     record_availability_result,
@@ -707,6 +711,8 @@ class RbacSetupTests(TestCase):
         self.assertIn("change_device", codenames)
         self.assertIn("change_alert", codenames)
         self.assertIn("view_metricrecord", codenames)
+        self.assertIn("view_sshcommandlog", codenames)
+        self.assertIn("execute_ssh_command", codenames)
         self.assertNotIn("delete_metricrecord", codenames)
 
     def test_setup_rbac_can_be_run_more_than_once(self):
@@ -720,4 +726,345 @@ class RbacSetupTests(TestCase):
         self.assertEqual(
             Group.objects.filter(name=NETWORK_ADMINISTRATORS_GROUP).count(),
             1,
+        )
+
+
+class SSHAdministrationTests(TestCase):
+    def setUp(self):
+        call_command("setup_rbac", verbosity=0)
+        self.device = Device.objects.create(
+            name="R1-ssh",
+            ip_address="192.168.10.91",
+            device_type=Device.DeviceType.ROUTER,
+            vlan_id=10,
+        )
+        self.monitoring_user = get_user_model().objects.create_user(
+            username="ssh-readonly",
+            password="safe-test-password",
+        )
+        self.monitoring_user.groups.add(
+            Group.objects.get(name=MONITORING_USERS_GROUP)
+        )
+        self.administrator = get_user_model().objects.create_user(
+            username="ssh-administrator",
+            password="safe-test-password",
+        )
+        self.administrator.groups.add(
+            Group.objects.get(name=NETWORK_ADMINISTRATORS_GROUP)
+        )
+
+    def test_monitoring_user_cannot_open_ssh_administration(self):
+        self.client.force_login(self.monitoring_user)
+
+        response = self.client.get(reverse("monitoring:ssh_administration"))
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_network_administrator_can_open_ssh_administration(self):
+        self.client.force_login(self.administrator)
+
+        response = self.client.get(reverse("monitoring:ssh_administration"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Remote router configuration")
+        self.assertContains(response, "name=\"command\"")
+
+    @patch.dict(
+        "monitoring.services.os.environ",
+        {
+            "NMS_SSH_USERNAME": "nmsadmin",
+            "NMS_SSH_PASSWORD": "",
+            "NMS_SSH_KEY_PATH": "C:/keys/nms_ed25519",
+            "NMS_SSH_KNOWN_HOSTS": "C:/keys/known_hosts",
+            "NMS_SSH_PORT": "22",
+        },
+    )
+    @patch("monitoring.services.paramiko.SSHClient")
+    @patch("monitoring.services.paramiko.RSAKey.from_private_key_file")
+    def test_approved_command_uses_key_authentication_and_is_audited(
+        self, load_private_key, ssh_client_class
+    ):
+        client = ssh_client_class.return_value
+        stdout = MagicMock()
+        stdout.read.return_value = b"R1 uptime is 1 hour"
+        stdout.channel.recv_exit_status.return_value = 0
+        stderr = MagicMock()
+        stderr.read.return_value = b""
+        client.exec_command.return_value = (MagicMock(), stdout, stderr)
+
+        log = execute_approved_ssh_command(
+            self.device,
+            "show_version",
+            self.administrator,
+        )
+
+        client.load_host_keys.assert_called_once_with("C:/keys/known_hosts")
+        client.connect.assert_called_once_with(
+            hostname="192.168.10.91",
+            port=22,
+            username="nmsadmin",
+            pkey=load_private_key.return_value,
+            look_for_keys=False,
+            allow_agent=False,
+            timeout=8,
+            banner_timeout=8,
+            auth_timeout=8,
+            disabled_algorithms={
+                "pubkeys": ["rsa-sha2-512", "rsa-sha2-256"],
+            },
+        )
+        client.exec_command.assert_called_once_with("show version", timeout=15)
+        self.assertTrue(log.successful)
+        self.assertEqual(log.user, self.administrator)
+        self.assertEqual(log.output, "R1 uptime is 1 hour")
+
+    @patch.dict(
+        "monitoring.services.os.environ",
+        {
+            "NMS_SSH_USERNAME": "nmsadmin",
+            "NMS_SSH_PASSWORD": "test-router-password",
+            "NMS_SSH_KEY_PATH": "",
+            "NMS_SSH_KNOWN_HOSTS": "C:/keys/known_hosts",
+            "NMS_SSH_PORT": "22",
+        },
+    )
+    @patch("monitoring.services.paramiko.SSHClient")
+    @patch("monitoring.services.paramiko.RSAKey.from_private_key_file")
+    def test_approved_command_can_use_password_authentication(
+        self, load_private_key, ssh_client_class
+    ):
+        client = ssh_client_class.return_value
+        stdout = MagicMock()
+        stdout.read.return_value = b"R1 uptime is 1 hour"
+        stdout.channel.recv_exit_status.return_value = 0
+        stderr = MagicMock()
+        stderr.read.return_value = b""
+        client.exec_command.return_value = (MagicMock(), stdout, stderr)
+
+        log = execute_approved_ssh_command(
+            self.device,
+            "show_version",
+            self.administrator,
+        )
+
+        load_private_key.assert_not_called()
+        client.connect.assert_called_once_with(
+            hostname="192.168.10.91",
+            port=22,
+            username="nmsadmin",
+            password="test-router-password",
+            look_for_keys=False,
+            allow_agent=False,
+            timeout=8,
+            banner_timeout=8,
+            auth_timeout=8,
+        )
+        self.assertTrue(log.successful)
+
+    @patch.dict(
+        "monitoring.services.os.environ",
+        {
+            "NMS_SSH_USERNAME": "nmsadmin",
+            "NMS_SSH_PASSWORD": "test-router-password",
+            "NMS_SSH_KEY_PATH": "",
+            "NMS_SSH_KNOWN_HOSTS": "C:/keys/known_hosts",
+            "NMS_SSH_PORT": "22",
+        },
+    )
+    @patch("monitoring.services.time.sleep")
+    @patch("monitoring.services.time.monotonic", side_effect=[0, 0, 0, 1])
+    @patch("monitoring.services.paramiko.SSHClient")
+    def test_configuration_action_uses_fixed_shell_commands_and_is_audited(
+        self, ssh_client_class, _monotonic, _sleep
+    ):
+        channel = ssh_client_class.return_value.invoke_shell.return_value
+        channel.recv_ready.side_effect = [False, True]
+        channel.recv.return_value = b"R1#\r\nBuilding configuration...\r\n[OK]\r\nR1#"
+
+        log = execute_approved_ssh_command(
+            self.device,
+            "apply_ssh_security",
+            self.administrator,
+        )
+
+        sent_commands = [call.args[0] for call in channel.send.call_args_list]
+        self.assertEqual(
+            sent_commands,
+            [
+                "terminal length 0\n",
+                "configure terminal\n",
+                "ip ssh time-out 60\n",
+                "ip ssh authentication-retries 3\n",
+                "end\n",
+                "write memory\n",
+            ],
+        )
+        self.assertTrue(log.successful)
+        self.assertIn("Building configuration", log.output)
+
+    def test_unapproved_command_is_rejected_without_an_ssh_connection(self):
+        with self.assertRaisesMessage(ValueError, "not approved"):
+            execute_approved_ssh_command(
+                self.device,
+                "configure_terminal",
+                self.administrator,
+            )
+
+        self.assertEqual(SSHCommandLog.objects.count(), 0)
+
+    def test_service_rejects_monitoring_user(self):
+        with self.assertRaisesMessage(PermissionDenied, "cannot execute"):
+            execute_approved_ssh_command(
+                self.device,
+                "show_version",
+                self.monitoring_user,
+            )
+
+    def test_destructive_custom_command_is_rejected_before_connecting(self):
+        with self.assertRaisesMessage(ValueError, "blocked"):
+            execute_remote_ssh_command(
+                self.device,
+                "reload",
+                self.administrator,
+            )
+
+        self.assertEqual(SSHCommandLog.objects.count(), 0)
+
+    @patch.dict(
+        "monitoring.services.os.environ",
+        {
+            "NMS_SSH_USERNAME": "nmsadmin",
+            "NMS_SSH_PASSWORD": "test-router-password",
+            "NMS_SSH_KEY_PATH": "",
+            "NMS_SSH_KNOWN_HOSTS": "C:/keys/known_hosts",
+            "NMS_SSH_PORT": "22",
+        },
+    )
+    @patch("monitoring.services.paramiko.SSHClient")
+    def test_custom_show_command_runs_directly(self, ssh_client_class):
+        client = ssh_client_class.return_value
+        stdout = MagicMock()
+        stdout.read.return_value = b"Interface IP-Address OK? Method Status Protocol"
+        stdout.channel.recv_exit_status.return_value = 0
+        stderr = MagicMock()
+        stderr.read.return_value = b""
+        client.exec_command.return_value = (MagicMock(), stdout, stderr)
+
+        log = execute_remote_ssh_command(
+            self.device,
+            "show ip interface brief",
+            self.administrator,
+        )
+
+        client.exec_command.assert_called_once_with(
+            "show ip interface brief", timeout=15
+        )
+        self.assertEqual(log.command_key, "custom")
+        self.assertTrue(log.successful)
+
+    @patch.dict(
+        "monitoring.services.os.environ",
+        {
+            "NMS_SSH_USERNAME": "nmsadmin",
+            "NMS_SSH_PASSWORD": "test-router-password",
+            "NMS_SSH_KEY_PATH": "",
+            "NMS_SSH_KNOWN_HOSTS": "C:/keys/known_hosts",
+            "NMS_SSH_PORT": "22",
+        },
+    )
+    @patch("monitoring.services.paramiko.SSHClient")
+    def test_abbreviated_show_command_runs_in_operational_mode(
+        self, ssh_client_class
+    ):
+        client = ssh_client_class.return_value
+        stdout = MagicMock()
+        stdout.read.return_value = b"FastEthernet0/0 192.168.10.1 up up"
+        stdout.channel.recv_exit_status.return_value = 0
+        stderr = MagicMock()
+        stderr.read.return_value = b""
+        client.exec_command.return_value = (MagicMock(), stdout, stderr)
+
+        log = execute_remote_ssh_command(
+            self.device,
+            "sh ip int br",
+            self.administrator,
+        )
+
+        client.exec_command.assert_called_once_with("sh ip int br", timeout=15)
+        client.invoke_shell.assert_not_called()
+        self.assertTrue(log.successful)
+
+    @patch.dict(
+        "monitoring.services.os.environ",
+        {
+            "NMS_SSH_USERNAME": "nmsadmin",
+            "NMS_SSH_PASSWORD": "test-router-password",
+            "NMS_SSH_KEY_PATH": "",
+            "NMS_SSH_KNOWN_HOSTS": "C:/keys/known_hosts",
+            "NMS_SSH_PORT": "22",
+        },
+    )
+    @patch("monitoring.services.paramiko.SSHClient")
+    def test_cisco_error_in_stdout_marks_operational_command_failed(
+        self, ssh_client_class
+    ):
+        client = ssh_client_class.return_value
+        stdout = MagicMock()
+        stdout.read.return_value = b'Line has invalid autocommand "show vlan brief"'
+        stdout.channel.recv_exit_status.return_value = 0
+        stderr = MagicMock()
+        stderr.read.return_value = b""
+        client.exec_command.return_value = (MagicMock(), stdout, stderr)
+
+        log = execute_remote_ssh_command(
+            self.device,
+            "show vlan brief",
+            self.administrator,
+        )
+
+        self.assertFalse(log.successful)
+        self.assertIn("invalid autocommand", log.output)
+
+    @patch.dict(
+        "monitoring.services.os.environ",
+        {
+            "NMS_SSH_USERNAME": "nmsadmin",
+            "NMS_SSH_PASSWORD": "test-router-password",
+            "NMS_SSH_KEY_PATH": "",
+            "NMS_SSH_KNOWN_HOSTS": "C:/keys/known_hosts",
+            "NMS_SSH_PORT": "22",
+        },
+    )
+    @patch("monitoring.services.time.sleep")
+    @patch("monitoring.services.time.monotonic", side_effect=[0, 0, 0, 1])
+    @patch("monitoring.services.paramiko.SSHClient")
+    def test_custom_configuration_sequence_is_saved_and_audited(
+        self, ssh_client_class, _monotonic, _sleep
+    ):
+        channel = ssh_client_class.return_value.invoke_shell.return_value
+        channel.recv_ready.side_effect = [False, True]
+        channel.recv.return_value = b"Building configuration...\r\n[OK]\r\nR1#"
+
+        log = execute_remote_ssh_command(
+            self.device,
+            "interface Loopback9 ; description Dashboard-Test",
+            self.administrator,
+        )
+
+        sent_commands = [call.args[0] for call in channel.send.call_args_list]
+        self.assertEqual(
+            sent_commands,
+            [
+                "terminal length 0\n",
+                "configure terminal\n",
+                "interface Loopback9\n",
+                "description Dashboard-Test\n",
+                "end\n",
+                "write memory\n",
+            ],
+        )
+        self.assertTrue(log.successful)
+        self.assertEqual(
+            log.command,
+            "interface Loopback9 ; description Dashboard-Test",
         )

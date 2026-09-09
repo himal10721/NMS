@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SSH Administration</title>
+  <style>
+    :root{--teal:#00a6b4;--ink:#17293d;--muted:#758294;--line:#dce5ed;--bg:#f4f7fa;--card:#fff;--red:#c83f45;--green:#19835b}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 "Segoe UI",sans-serif}.top{height:66px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px}.top a{color:var(--teal);text-decoration:none}.wrap{max-width:1100px;margin:28px auto;padding:0 20px}.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:22px;margin-bottom:18px}.grid{display:grid;grid-template-columns:1fr 2fr auto;gap:14px;align-items:end}label{font-weight:600;display:block;margin-bottom:5px}select,input{width:100%;padding:10px;border:1px solid var(--line);border-radius:7px;background:#fff}button{padding:10px 18px;border:0;border-radius:7px;background:var(--teal);color:#fff;font-weight:700;cursor:pointer}.hint{color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;background:#0d2233;color:#e7f6ff;padding:16px;border-radius:8px;max-height:420px;overflow:auto}.ok{color:var(--green)}.failed{color:var(--red)}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:12px}@media(max-width:700px){.grid{grid-template-columns:1fr}.top{padding:0 16px}}
+  </style>
+</head>
+<body>
+  <header class="top"><strong>Secure SSH Administration</strong><div><span>{{ request.user.username }}</span> · <a href="{% url 'monitoring:dashboard' %}">Dashboard</a></div></header>
+  <main class="wrap">
+    <section class="card"><h1>Remote router configuration</h1><form method="post" id="ssh-command-form">{% csrf_token %}<div class="grid"><div><label for="{{ form.device.id_for_label }}">Device</label>{{ form.device }}</div><div><label for="{{ form.command.id_for_label }}">Cisco command</label>{{ form.command }}</div><button type="submit">Run command</button></div>{{ form.errors }}</form></section>
+    {% if result %}<section class="card"><h2 class="{% if result.successful %}ok{% else %}failed{% endif %}">{% if result.successful %}Command completed{% else %}Command failed{% endif %}</h2><p><strong>{{ result.device.name }}</strong> · <code>{{ result.command }}</code></p><pre>{% if result.successful %}{{ result.output|default:"Command completed without output." }}{% elif result.error %}{{ result.error }}{% else %}{{ result.output|default:"The router returned no output." }}{% endif %}</pre></section>{% endif %}
+    <section class="card"><h2>Recent command audit</h2><table><thead><tr><th>Time</th><th>User</th><th>Device</th><th>Command</th><th>Result</th></tr></thead><tbody>{% for item in recent_commands %}<tr><td>{{ item.executed_at|date:"d M H:i:s" }}</td><td>{{ item.user.username }}</td><td>{{ item.device.name }}</td><td>{{ item.command }}</td><td class="{% if item.successful %}ok{% else %}failed{% endif %}">{% if item.successful %}Success{% else %}Failed{% endif %}</td></tr>{% empty %}<tr><td colspan="5">No commands have been executed.</td></tr>{% endfor %}</tbody></table></section>
+  </main>
+  <script>document.getElementById("id_command").addEventListener("keydown",function(event){if(event.key==="Enter"){event.preventDefault();document.getElementById("ssh-command-form").requestSubmit();}});</script>
+</body>
+</html>

@@ -186,3 +186,39 @@ def dashboard(request):
     }
 
     return render(request, "monitoring/dashboard.html", context)
+
+
+@login_required
+@permission_required("monitoring.execute_ssh_command", raise_exception=True)
+def ssh_administration(request):
+    """Run administrator-entered Cisco commands and show the audit history."""
+    from .forms import SSHCommandForm
+    from .models import SSHCommandLog
+    from .services import execute_remote_ssh_command
+
+    result = None
+    if request.method == "POST":
+        form = SSHCommandForm(request.POST)
+        if form.is_valid():
+            try:
+                result = execute_remote_ssh_command(
+                    form.cleaned_data["device"],
+                    form.cleaned_data["command"],
+                    request.user,
+                )
+            except ValueError as exc:
+                form.add_error("command", str(exc))
+    else:
+        form = SSHCommandForm()
+
+    return render(
+        request,
+        "monitoring/ssh_administration.html",
+        {
+            "form": form,
+            "result": result,
+            "recent_commands": SSHCommandLog.objects.select_related(
+                "device", "user"
+            )[:10],
+        },
+    )

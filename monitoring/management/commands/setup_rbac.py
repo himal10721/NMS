@@ -30,7 +30,7 @@ class Command(BaseCommand):
             codename__startswith="view_",
         )
         administrator_write_permissions = Permission.objects.filter(
-            content_type__in=content_types,
+            content_type__app_label="monitoring",
             codename__in=ADMINISTRATOR_WRITE_PERMISSIONS,
         )
 

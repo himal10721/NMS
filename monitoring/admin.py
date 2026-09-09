@@ -8,6 +8,7 @@ from .models import (
     MetricRecord,
     NetworkEvent,
     NetworkInterface,
+    SSHCommandLog,
 )
 
 
@@ -153,3 +154,37 @@ class NetworkEventAdmin(admin.ModelAdmin):
         "message",
         "received_at",
     )
+
+
+@admin.register(SSHCommandLog)
+class SSHCommandLogAdmin(admin.ModelAdmin):
+    """Read-only audit history for administrator SSH actions."""
+
+    list_display = (
+        "executed_at",
+        "user",
+        "device",
+        "command_key",
+        "successful",
+    )
+    list_filter = ("successful", "command_key", "device")
+    search_fields = ("user__username", "device__name", "command", "output", "error")
+    readonly_fields = (
+        "device",
+        "user",
+        "command_key",
+        "command",
+        "successful",
+        "output",
+        "error",
+        "executed_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

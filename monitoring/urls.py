@@ -7,4 +7,5 @@ app_name = "monitoring"
 
 urlpatterns = [
     path("", views.dashboard, name="dashboard"),
+    path("administration/ssh/", views.ssh_administration, name="ssh_administration"),
 ]
