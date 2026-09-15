@@ -80,6 +80,7 @@ LOGIN_SOURCE_PATTERNS = (
     re.compile(r"source(?:=|:)\s*(\d{1,3}(?:\.\d{1,3}){3})", re.IGNORECASE),
 )
 
+# Built-in actions use fixed command sequences so they cannot be changed in the browser.
 APPROVED_SSH_COMMANDS = {
     "show_version": ("Show software version", ("show version",), False),
     "show_ip_interface_brief": (
@@ -114,6 +115,7 @@ APPROVED_SSH_COMMANDS = {
     ),
 }
 SSH_OUTPUT_LIMIT = 50_000
+# Cisco IOS often reports command errors in the output rather than through an exit code.
 SSH_ERROR_MARKERS = (
     "% invalid input",
     "% incomplete command",
@@ -1099,26 +1101,30 @@ def record_syslog_event(
 
 def execute_approved_ssh_command(device: Device, command_key: str, user):
     """Execute one fixed, allowlisted SSH action and persist its audit record."""
-    command_spec = APPROVED_SSH_COMMANDS.get(command_key)
+    command_spec = APPROVED_SSH_COMMANDS.get(command_key)  # Find the saved action.
     if command_spec is None:
         raise ValueError("The requested SSH command is not approved.")
-    _label, commands, requires_shell = command_spec
+    _label, commands, requires_shell = command_spec  # Split its display label and commands.
     return _execute_ssh_action(
-        device=device,
-        user=user,
-        command_key=command_key,
-        commands=commands,
-        requires_shell=requires_shell,
-        audit_command=" ; ".join(commands),
+        device=device,  # Router or switch selected on the page.
+        user=user,  # Signed-in administrator running the action.
+        command_key=command_key,  # Short name stored in the audit record.
+        commands=commands,  # Fixed IOS commands from the allowlist.
+        requires_shell=requires_shell,  # Configuration needs an interactive session.
+        audit_command=" ; ".join(commands),  # Readable version for the history table.
     )
 
 
 def execute_remote_ssh_command(device: Device, command_text: str, user):
     """Execute an administrator-supplied Cisco command with safety controls."""
+    # Keep this check in the service as well as the view. This prevents the
+    # function being called directly by an account without the required role.
     if not user.has_perm("monitoring.execute_ssh_command"):
         raise PermissionDenied("This account cannot execute SSH commands.")
 
-    command_text = command_text.strip()
+    # The web form accepts one line. Semicolons are used when a configuration
+    # needs more than one IOS command.
+    command_text = command_text.strip()  # Remove accidental spaces around the input.
     if not command_text:
         raise ValueError("Enter a command to execute.")
     if len(command_text) > 200:
@@ -1126,24 +1132,32 @@ def execute_remote_ssh_command(device: Device, command_text: str, user):
     if any(character in command_text for character in "\r\n\x00"):
         raise ValueError("Enter commands on one line and separate steps with semicolons.")
 
-    commands = tuple(part.strip() for part in command_text.split(";") if part.strip())
+    commands = tuple(
+        part.strip() for part in command_text.split(";") if part.strip()
+    )  # Turn the single form field into individual IOS commands.
     if not commands:
         raise ValueError("Enter a command to execute.")
     if any(SSH_BLOCKED_COMMAND.search(command) for command in commands):
         raise ValueError("Destructive reload, erase, delete and format commands are blocked.")
 
-    requires_shell = len(commands) > 1 or not SSH_OPERATIONAL_COMMAND.search(commands[0])
+    # Show, ping and traceroute commands can run directly. Configuration
+    # commands need an interactive shell so IOS keeps the current mode.
+    requires_shell = (
+        len(commands) > 1 or not SSH_OPERATIONAL_COMMAND.search(commands[0])
+    )  # Configuration commands need IOS to keep track of the current mode.
     if requires_shell:
         if commands[0].lower() in ("configure terminal", "conf t"):
-            commands = commands[1:]
+            commands = commands[1:]  # The service adds configuration mode itself.
         if not commands:
             raise ValueError("Enter a configuration command after configure terminal.")
+        # Add the IOS configuration steps automatically and save the change.
         shell_commands = ("configure terminal", *commands)
         if commands[-1].lower() != "end":
-            shell_commands += ("end",)
-        shell_commands += ("write memory",)
-        commands = shell_commands
+            shell_commands += ("end",)  # Return to privileged EXEC mode.
+        shell_commands += ("write memory",)  # Keep the change after a restart.
+        commands = shell_commands  # Send the completed sequence to the router.
 
+    # Secrets typed in a command must not be copied into the audit history.
     audit_command = SSH_SENSITIVE_VALUE.sub(r"\1 <redacted>", command_text)
     return _execute_ssh_action(
         device=device,
@@ -1160,16 +1174,18 @@ def _execute_ssh_action(
     requires_shell: bool, audit_command: str
 ):
     """Connect, execute a validated action and create its immutable audit row."""
-    from .models import SSHCommandLog
+    from .models import SSHCommandLog  # Imported here to avoid a circular import.
 
     if not user.has_perm("monitoring.execute_ssh_command"):
         raise PermissionDenied("This account cannot execute SSH commands.")
 
-    username = os.environ.get("NMS_SSH_USERNAME", "").strip()
-    key_path = os.environ.get("NMS_SSH_KEY_PATH", "").strip()
-    password = os.environ.get("NMS_SSH_PASSWORD", "")
-    known_hosts = os.environ.get("NMS_SSH_KNOWN_HOSTS", "").strip()
-    port_text = os.environ.get("NMS_SSH_PORT", "22")
+    # Credentials are supplied when the server starts rather than stored in
+    # the database or committed to the project.
+    username = os.environ.get("NMS_SSH_USERNAME", "").strip()  # IOS login name.
+    key_path = os.environ.get("NMS_SSH_KEY_PATH", "").strip()  # Optional private key.
+    password = os.environ.get("NMS_SSH_PASSWORD", "")  # Password fallback for the lab.
+    known_hosts = os.environ.get("NMS_SSH_KNOWN_HOSTS", "").strip()  # Trusted host keys.
+    port_text = os.environ.get("NMS_SSH_PORT", "22")  # SSH normally uses port 22.
     if not username or not known_hosts or not (password or key_path):
         error = (
             "SSH is not configured. Set NMS_SSH_USERNAME, NMS_SSH_KNOWN_HOSTS "
@@ -1184,7 +1200,7 @@ def _execute_ssh_action(
             error=error,
         )
     try:
-        port = int(port_text)
+        port = int(port_text)  # Environment variables arrive as text.
         if not 1 <= port <= 65535:
             raise ValueError
     except ValueError:
@@ -1197,22 +1213,23 @@ def _execute_ssh_action(
             error="NMS_SSH_PORT must be a number between 1 and 65535.",
         )
 
-    client = paramiko.SSHClient()
+    client = paramiko.SSHClient()  # Create a new connection for this request.
     try:
+        # Reject an unexpected host key instead of silently trusting a device.
         client.load_host_keys(known_hosts)
         client.set_missing_host_key_policy(paramiko.RejectPolicy())
         connection_options = {
-            "hostname": str(device.ip_address),
+            "hostname": str(device.ip_address),  # Address stored against the device.
             "port": port,
             "username": username,
-            "look_for_keys": False,
-            "allow_agent": False,
+            "look_for_keys": False,  # Only use the credentials configured for the NMS.
+            "allow_agent": False,  # Do not pick up keys from the user's SSH agent.
             "timeout": 8,
             "banner_timeout": 8,
             "auth_timeout": 8,
         }
         if password:
-            connection_options["password"] = password
+            connection_options["password"] = password  # Password authentication in the lab.
         else:
             connection_options["pkey"] = paramiko.RSAKey.from_private_key_file(
                 key_path
@@ -1221,20 +1238,21 @@ def _execute_ssh_action(
             connection_options["disabled_algorithms"] = {
                 "pubkeys": ["rsa-sha2-512", "rsa-sha2-256"],
             }
-        client.connect(**connection_options)
+        client.connect(**connection_options)  # Open the SSH session to the selected device.
         if requires_shell:
+            # Clear the initial router prompt before sending the requested commands.
             channel = client.invoke_shell(width=160, height=1000)
             time.sleep(0.3)
             if channel.recv_ready():
-                channel.recv(SSH_OUTPUT_LIMIT)
+                channel.recv(SSH_OUTPUT_LIMIT)  # Discard the banner and initial prompt.
             for item in ("terminal length 0", *commands):
-                channel.send(item + "\n")
-                time.sleep(0.4)
-            chunks = []
-            deadline = time.monotonic() + 15
+                channel.send(item + "\n")  # IOS runs the command after the newline.
+                time.sleep(0.4)  # Give the older IOS image time to respond.
+            chunks = []  # Output may arrive in several network packets.
+            deadline = time.monotonic() + 15  # Prevent a command hanging the web request.
             while time.monotonic() < deadline:
                 if channel.recv_ready():
-                    chunks.append(channel.recv(4096))
+                    chunks.append(channel.recv(4096))  # Read the next available block.
                     deadline = min(deadline, time.monotonic() + 0.8)
                 else:
                     time.sleep(0.1)
@@ -1243,11 +1261,14 @@ def _execute_ssh_action(
             )
             error = ""
             lowered_output = output.lower()
+            # IOS can return a prompt even when a command failed, so inspect the text.
             successful = not any(
                 marker in lowered_output for marker in SSH_ERROR_MARKERS
             )
         else:
-            _stdin, stdout, stderr = client.exec_command(commands[0], timeout=15)
+            _stdin, stdout, stderr = client.exec_command(
+                commands[0], timeout=15
+            )  # Show commands do not need an interactive shell.
             output = stdout.read(SSH_OUTPUT_LIMIT).decode("utf-8", errors="replace")
             error = stderr.read(SSH_OUTPUT_LIMIT).decode("utf-8", errors="replace")
             exit_status = stdout.channel.recv_exit_status()
@@ -1261,11 +1282,12 @@ def _execute_ssh_action(
             )
     except Exception as exc:
         output = ""
-        error = str(exc)
+        error = str(exc)  # Keep the failure reason for the administrator.
         successful = False
     finally:
-        client.close()
+        client.close()  # Close the socket whether the command passed or failed.
 
+    # Failed attempts are stored too, which gives the administrator a complete trail.
     return SSHCommandLog.objects.create(
         device=device,
         user=user,

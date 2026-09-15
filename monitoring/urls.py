@@ -6,6 +6,10 @@ from . import views
 app_name = "monitoring"
 
 urlpatterns = [
-    path("", views.dashboard, name="dashboard"),
-    path("administration/ssh/", views.ssh_administration, name="ssh_administration"),
+    path("", views.dashboard, name="dashboard"),  # Main monitoring page.
+    path(
+        "administration/ssh/",
+        views.ssh_administration,
+        name="ssh_administration",
+    ),  # Remote command and audit page.
 ]

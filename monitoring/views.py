@@ -196,29 +196,29 @@ def ssh_administration(request):
     from .models import SSHCommandLog
     from .services import execute_remote_ssh_command
 
-    result = None
+    result = None  # Nothing is shown in the result panel before the first command.
     if request.method == "POST":
-        form = SSHCommandForm(request.POST)
+        form = SSHCommandForm(request.POST)  # Bind the submitted device and command.
         if form.is_valid():
             try:
                 result = execute_remote_ssh_command(
-                    form.cleaned_data["device"],
-                    form.cleaned_data["command"],
-                    request.user,
+                    form.cleaned_data["device"],  # Selected router or switch.
+                    form.cleaned_data["command"],  # Command typed by the administrator.
+                    request.user,  # Used for permission checking and auditing.
                 )
             except ValueError as exc:
-                form.add_error("command", str(exc))
+                form.add_error("command", str(exc))  # Show validation errors on the form.
     else:
-        form = SSHCommandForm()
+        form = SSHCommandForm()  # Empty form for an ordinary page request.
 
     return render(
         request,
         "monitoring/ssh_administration.html",
         {
             "form": form,
-            "result": result,
+            "result": result,  # Output or error returned by the SSH service.
             "recent_commands": SSHCommandLog.objects.select_related(
                 "device", "user"
-            )[:10],
+            )[:10],  # Keep the dashboard history short and readable.
         },
     )

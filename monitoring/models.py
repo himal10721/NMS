@@ -273,25 +273,25 @@ class SSHCommandLog(models.Model):
 
     device = models.ForeignKey(
         Device,
-        on_delete=models.PROTECT,
+        on_delete=models.PROTECT,  # Keep the device while its audit records exist.
         related_name="ssh_command_logs",
     )
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
-        on_delete=models.PROTECT,
+        on_delete=models.PROTECT,  # Keep the user named in the audit history.
         related_name="ssh_command_logs",
     )
-    command_key = models.CharField(max_length=50)
-    command = models.CharField(max_length=200)
-    successful = models.BooleanField(default=False)
-    output = models.TextField(blank=True)
-    error = models.TextField(blank=True)
-    executed_at = models.DateTimeField(auto_now_add=True)
+    command_key = models.CharField(max_length=50)  # Built-in action name or "custom".
+    command = models.CharField(max_length=200)  # Redacted command shown in the history.
+    successful = models.BooleanField(default=False)  # Final result of the attempt.
+    output = models.TextField(blank=True)  # Text returned by Cisco IOS.
+    error = models.TextField(blank=True)  # Connection or command failure details.
+    executed_at = models.DateTimeField(auto_now_add=True)  # Set when the row is created.
 
     class Meta:
-        ordering = ["-executed_at"]
+        ordering = ["-executed_at"]  # Display the newest commands first.
         permissions = [
-            ("execute_ssh_command", "Can execute approved SSH commands"),
+            ("execute_ssh_command", "Can execute approved SSH commands"),  # Admin role.
         ]
 
     def __str__(self) -> str:

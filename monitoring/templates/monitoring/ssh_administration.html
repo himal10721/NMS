@@ -11,10 +11,14 @@
 <body>
   <header class="top"><strong>Secure SSH Administration</strong><div><span>{{ request.user.username }}</span> · <a href="{% url 'monitoring:dashboard' %}">Dashboard</a></div></header>
   <main class="wrap">
+    {# Device selector and the command sent to the Django view. #}
     <section class="card"><h1>Remote router configuration</h1><form method="post" id="ssh-command-form">{% csrf_token %}<div class="grid"><div><label for="{{ form.device.id_for_label }}">Device</label>{{ form.device }}</div><div><label for="{{ form.command.id_for_label }}">Cisco command</label>{{ form.command }}</div><button type="submit">Run command</button></div>{{ form.errors }}</form></section>
+    {# Show the router output or the reason the command failed. #}
     {% if result %}<section class="card"><h2 class="{% if result.successful %}ok{% else %}failed{% endif %}">{% if result.successful %}Command completed{% else %}Command failed{% endif %}</h2><p><strong>{{ result.device.name }}</strong> · <code>{{ result.command }}</code></p><pre>{% if result.successful %}{{ result.output|default:"Command completed without output." }}{% elif result.error %}{{ result.error }}{% else %}{{ result.output|default:"The router returned no output." }}{% endif %}</pre></section>{% endif %}
+    {# Keep the ten most recent attempts visible to the administrator. #}
     <section class="card"><h2>Recent command audit</h2><table><thead><tr><th>Time</th><th>User</th><th>Device</th><th>Command</th><th>Result</th></tr></thead><tbody>{% for item in recent_commands %}<tr><td>{{ item.executed_at|date:"d M H:i:s" }}</td><td>{{ item.user.username }}</td><td>{{ item.device.name }}</td><td>{{ item.command }}</td><td class="{% if item.successful %}ok{% else %}failed{% endif %}">{% if item.successful %}Success{% else %}Failed{% endif %}</td></tr>{% empty %}<tr><td colspan="5">No commands have been executed.</td></tr>{% endfor %}</tbody></table></section>
   </main>
+  {# Pressing Enter submits the command without adding another line. #}
   <script>document.getElementById("id_command").addEventListener("keydown",function(event){if(event.key==="Enter"){event.preventDefault();document.getElementById("ssh-command-form").requestSubmit();}});</script>
 </body>
 </html>
